@@ -1,7 +1,7 @@
 /**
  * @file ddhub.h
  * @brief Declare the portable Data Dispatch Hub API.
- * @details ddhub stands for Data Dispatch Hub, an event-driven data distribution center.
+ * @details ddhub - Data Dispatch Hub, an event-driven data distribution center.
  *          Define static subscription nodes, event callbacks, completion notifications, and C/C++ platform lock APIs.
  * @version 0.1.0
  * @date 2026-10-14 (development date)

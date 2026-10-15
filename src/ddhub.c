@@ -1,7 +1,7 @@
 /**
  * @file ddhub.c
  * @brief Implement static message queues and event-based data dispatch.
- * @details ddhub stands for Data Dispatch Hub, an event-driven data distribution center.
+ * @details ddhub - Data Dispatch Hub, an event-driven data distribution center.
  *          Manage intrusive subscriptions, stable priorities, per-hub FIFOs, completion callbacks, and injected locks.
  * @version 0.1.0
  * @date 2026-10-14 (development date)
