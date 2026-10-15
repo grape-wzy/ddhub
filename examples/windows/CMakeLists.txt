@@ -1,0 +1,15 @@
+cmake_minimum_required(VERSION 3.20)
+project(ddhub_windows_example C)
+
+if(NOT WIN32)
+    message(FATAL_ERROR "Build this example with a Windows toolchain; use ../linux for Linux.")
+endif()
+
+add_subdirectory("${CMAKE_CURRENT_LIST_DIR}/../common" "${CMAKE_CURRENT_BINARY_DIR}/common")
+add_executable(ddhub_windows_example main.c)
+target_link_libraries(ddhub_windows_example PRIVATE ddhub_example_core)
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(ddhub_windows_example PRIVATE -Wall -Wextra -Werror -Wpedantic)
+elseif(MSVC)
+    target_compile_options(ddhub_windows_example PRIVATE /W4)
+endif()

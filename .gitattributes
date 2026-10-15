@@ -1,0 +1,2 @@
+# Normalize text in Git while preserving platform-native working-tree line endings.
+* text=auto

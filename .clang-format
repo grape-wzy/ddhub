@@ -1,0 +1,36 @@
+# Project C/C++ style: Linux-derived, for owned source code.
+# Requires clang-format 23 or newer for PackArguments.BreakAfter.
+---
+Language: Cpp
+BasedOnStyle: LLVM
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 120
+BreakBeforeBraces: Linux
+AllowShortBlocksOnASingleLine: Never
+AllowShortCaseLabelsOnASingleLine: false
+AllowShortFunctionsOnASingleLine: Empty
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AlwaysBreakAfterReturnType: None
+BinPackParameters: true
+PackArguments:
+  BinPack: UseBreakAfter
+  BreakAfter: 3
+ContinuationIndentWidth: 4
+Cpp11BracedListStyle: true
+BreakAfterOpenBracketBracedList: true
+BreakBeforeCloseBracketBracedList: true
+DerivePointerAlignment: false
+IndentCaseBlocks: false
+IndentCaseLabels: false
+IndentGotoLabels: false
+PointerAlignment: Right
+ReflowComments: true
+SortIncludes: false
+SpaceBeforeParens: ControlStatements
+SpacesInParentheses: false
+AlignConsecutiveDeclarations: true
+AlignTrailingComments: true
+...

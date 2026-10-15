@@ -1,0 +1,15 @@
+cmake_minimum_required(VERSION 3.20)
+project(ddhub_linux_example C)
+
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(FATAL_ERROR "Build this example with a Linux toolchain; use ../windows for Windows.")
+endif()
+
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_package(Threads REQUIRED)
+add_subdirectory("${CMAKE_CURRENT_LIST_DIR}/../common" "${CMAKE_CURRENT_BINARY_DIR}/common")
+add_executable(ddhub_linux_example main.c)
+target_link_libraries(ddhub_linux_example PRIVATE ddhub_example_core Threads::Threads)
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(ddhub_linux_example PRIVATE -Wall -Wextra -Werror -Wpedantic)
+endif()

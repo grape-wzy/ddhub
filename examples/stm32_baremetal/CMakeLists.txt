@@ -1,0 +1,18 @@
+cmake_minimum_required(VERSION 3.20)
+project(ddhub_stm32_baremetal_example C)
+
+set(DDHUB_STM32_DEVICE_HEADER "stm32h723xx.h" CACHE STRING "STM32 CMSIS device header")
+set(DDHUB_STM32_CMSIS_INCLUDE_DIRS "" CACHE STRING "CMSIS Core and STM32 device include directories")
+if(NOT DDHUB_STM32_CMSIS_INCLUDE_DIRS)
+    message(FATAL_ERROR "Set DDHUB_STM32_CMSIS_INCLUDE_DIRS to the CMSIS Core and device header directories.")
+endif()
+
+add_subdirectory("${CMAKE_CURRENT_LIST_DIR}/../common" "${CMAKE_CURRENT_BINARY_DIR}/common")
+add_library(ddhub_stm32_example STATIC ddhub_stm32_example.c)
+target_link_libraries(ddhub_stm32_example PUBLIC ddhub_example_core)
+target_include_directories(ddhub_stm32_example PUBLIC "${CMAKE_CURRENT_LIST_DIR}")
+target_include_directories(ddhub_stm32_example SYSTEM PRIVATE ${DDHUB_STM32_CMSIS_INCLUDE_DIRS})
+target_compile_definitions(ddhub_stm32_example PRIVATE DDHUB_STM32_DEVICE_HEADER="${DDHUB_STM32_DEVICE_HEADER}")
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(ddhub_stm32_example PRIVATE -Wall -Wextra -Werror -Wpedantic)
+endif()

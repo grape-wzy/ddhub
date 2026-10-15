@@ -1,0 +1,21 @@
+# Local build directories and generated CMake files.
+/build/
+/out/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+compile_commands.json
+CMakeUserPresets.json
+
+# Compiler and linker outputs.
+*.o
+*.obj
+*.a
+*.lib
+*.exe
+*.elf
+*.bin
+*.hex
+*.map
