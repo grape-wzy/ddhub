@@ -35,7 +35,7 @@ Windows 示例的预期输出如下，其他平台只替换方括号中的平台
 [Windows] source=alarm_monitor message="alarm=clear" hub=CONTROL callback=on_alarm event=0x00000008
 ```
 
-下面命令从 ddhub 仓库根目录执行。组件位于父工程中时，先进入 `components/ddhub/`。
+下面命令从 ddhub 仓库根目录执行。
 
 ## Linux
 
@@ -107,7 +107,7 @@ if (status != DDHUB_OK) {
 可以继续使用 CubeMX/Keil/GCC 工程原有的启动与 UART 配置。
 
 提供的 CMake 工程可独立交叉编译示例静态库，或以 CMake target 方式链接进裸机应用。
-例如使用 GCC ARM 工具链验证源码：
+例如使用 GCC ARM 工具链构建静态库：
 
 ```sh
 cmake -G Ninja -S examples/stm32_baremetal -B build/stm32 \

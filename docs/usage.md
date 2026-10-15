@@ -7,20 +7,20 @@ Version: **0.1.0**. Release notes: **Initial version; first release**.
 **ddhub** stands for **Data Dispatch Hub**: Data is the payload, Dispatch is routing to interested subscribers,
 and Hub is the central coordination point. Together they describe a data distribution center.
 
-ddhub is an independent C component. Hub objects, FIFO descriptors, and processing state use static storage;
-applications provide intrusive subscription nodes. It allocates no heap memory and depends on neither Zephyr,
-an external list library, nor errno. Hub objects require no resource initialization, but platform lock callbacks
-must be bound before the first operation.
+ddhub is a portable C99 component with static hub objects and message queues.
+Applications provide intrusive subscription nodes and platform lock callbacks.
+Messages carry borrowed payload pointers, and subscribers receive matching events without heap allocation.
+C++ applications can use the public C API and link the implementation compiled as C.
 
 ## Files and configuration
 
-When embedded in the firmware project, the component resides in `components/ddhub/`:
+Component files:
 
 - `include/ddhub.h`: nodes, callbacks, platform lock types, status codes, and seven public operations.
 - `include/ddhub_config.h`: application-owned hub IDs and FIFO capacity.
-- `src/ddhub.c`: intrusive subscriptions, static FIFOs, nonblocking reservations, and dispatch.
+- `src/ddhub.c`: subscriptions, static FIFOs, and event dispatch.
 - `docs/`: this guide in English and Simplified Chinese.
-- `tests/`: standalone behavior and concurrency tests, also included by the parent host-test project.
+- `tests/`: automated component tests.
 - `examples/`: [Linux, Windows, and STM32 bare-metal examples](../examples/README.md).
 
 Edit `ddhub_id_t` in `ddhub_config.h`. Actual hub IDs must be consecutive, starting at zero;
@@ -36,18 +36,31 @@ For another project or test configuration, define `DDHUB_CONFIG_HEADER="my_ddhub
 for every translation unit using ddhub. The default configuration provides one `DDHUB_DEFAULT` hub
 and registers no business callbacks automatically.
 
-The public header needs only `<stddef.h>`, `<stdint.h>`, and the configuration header; the implementation
-also uses `<stdbool.h>`. The core requires C99 and calls no standard atomic APIs, compiler atomic builtins,
-or operating-system functions. Injected platform lock/unlock callbacks provide exclusion and memory visibility
-for ordinary bool flags and counters. Component and host-test C99 requirements do not change the language standard
-of other application sources.
+## CMake integration
 
-Public and test headers provide `__cplusplus` linkage guards. C++ applications may include the public API
-and link the implementation compiled as C. Static subscription nodes are zero-initialized by C and C++.
+Build the `ddhub` C99 static library from the repository root:
 
-All source files and headers use English Doxygen documentation, including `@file`, `@brief`, `@details`,
-`@version 0.1.0`, initial-release notes, development dates, and modification history.
-Existing files retain their 2026-10-14 development date; new platform adapters and examples use 2026-10-15.
+```sh
+cmake -G Ninja -S . -B build/library
+cmake --build build/library
+```
+
+To use it from another CMake project:
+
+```cmake
+add_subdirectory(path/to/ddhub)
+target_link_libraries(my_application PRIVATE ddhub)
+```
+
+If the application provides its own configuration header, apply its include directory and definition from the parent:
+
+```cmake
+target_include_directories(ddhub PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/config")
+target_compile_definitions(ddhub PUBLIC DDHUB_CONFIG_HEADER="my_ddhub_config.h")
+```
+
+The library and its consumers share the selected configuration.
+Use the application's toolchain settings for the target platform.
 
 ## Platform lock adapters
 
@@ -61,28 +74,21 @@ typedef void (*ddhub_unlock_t)(ddhub_lock_key_t key);
 ddhub_status_t ddhub_set_lock_ops(ddhub_lock_t lock, ddhub_unlock_t unlock);
 ```
 
-The lock callback must successfully enter real mutual exclusion and return a token for that acquisition.
-Unlock receives that token unchanged and leaves the region. Keep the token in a per-call local variable;
-it may represent a saved interrupt mask and must not be replaced by a shared global token.
-Adapters that require no restoration state, such as a Linux mutex adapter, may return zero.
+The lock callback enters mutual exclusion and returns an opaque token. Unlock receives the matching token
+unchanged in the same execution context. An interrupt adapter can use it to restore the previous mask;
+an adapter that needs no restoration state may return zero.
 
-Both callbacks must provide exclusion and correct memory ordering. Empty functions and ordinary bool assignments
-do not meet this contract. Neither callback may reenter ddhub.
-Regions protect shared-state checks and fixed-size descriptor updates; they never copy payload bytes,
-traverse subscription lists, or execute user callbacks. ALL admission and cleanup visit the configured number
-of hubs, so consider that bound when evaluating interrupt latency on bare metal.
-
-The adapter must cover every supported execution context. A single-core MCU can use short critical sections;
-multiple cores and concurrent threads require an appropriate system synchronization mechanism.
-Interrupt or nonblocking use requires an adapter with matching properties. A blocking Linux mutex adapter
-cannot serve an MCU interrupt context.
+The adapter provides exclusion and memory visibility for every supported calling context.
+Lock acquisition must succeed, and the adapter callbacks must not reenter ddhub.
+For interrupt access, use an interrupt-compatible adapter; for multiple cores, use cross-core synchronization.
+Consumer callbacks and completion notifications execute outside platform exclusion.
 
 A NULL callback returns `DDHUB_INVALID`. Before binding, otherwise valid registration, unregistration,
 completion configuration, send, and processing calls return `DDHUB_NOT_READY`.
 Binding is allowed only once from serialized startup; repeated binding returns `DDHUB_BUSY`.
 It does not reset hubs, nodes, or queues and cannot switch synchronization domains at runtime.
 
-Example Zephyr/STM32 adapter:
+Example Zephyr adapter:
 
 ```c
 #include "ddhub.h"
@@ -163,9 +169,7 @@ ddhub_status_t example_bind_mutex_lock(void)
 }
 ```
 
-The example terminates the process if a mutex operation fails. Product code may use another fatal-error policy,
-but must not continue with unprotected shared-state access. pthread and its error handling belong to the adapter,
-not the ddhub core.
+This example uses a pthread mutex and terminates the process if a mutex operation fails.
 
 ## Subscriptions and events
 
@@ -178,19 +182,14 @@ static ddhub_subscription_t subscription;
 Static zero initialization leaves it unregistered. A node may belong to only one hub at a time;
 different nodes may use the same callback function. ddhub owns its fields while registered.
 Do not modify, copy, or reinitialize a registered node.
-Successful unregistration clears the list link and registration flag so the node can be reused;
-the next registration overwrites the remaining private fields.
+Successful unregistration makes the node available for reuse.
 To change events, priority, callback, or context pointers, unregister first and then register again.
 
 Distinct nodes belonging to different hubs can be registered or unregistered concurrently.
-A's list operation does not cause B to return busy merely because A's object reservation is held.
-Conflicting metadata operations on the same hub return `DDHUB_BUSY`.
+Registering or unregistering on A does not make B busy. Conflicting operations on the same hub return `DDHUB_BUSY`.
 
-Node ownership is arbitrated under platform exclusion. Competing registrations cannot place the same node
-in two lists simultaneously. Unregistration resolves and reserves the owner in the same critical section,
-then unlinks the node before publishing its availability.
-Another caller may register the node before the previous unregister call returns, so applications must coordinate
-reuse and lifetime. Do not free, copy, or reinitialize it while concurrent operations still refer to it.
+Concurrent registration cannot attach the same node to two hubs. Applications coordinate node reuse and lifetime,
+keeping it valid until unregistration succeeds and all concurrent operations referring to it have returned.
 
 Each hub has an application-defined `uint32_t` event mask. Neither a subscription mask nor a published mask may be zero.
 All 32 bits, including bit 31, are available.
@@ -213,7 +212,7 @@ After unregistering and re-registering, a node moves behind existing nodes of eq
 | --- | --- |
 | `ddhub_set_lock_ops(lock, unlock)` | Bind platform exclusion callbacks once at startup |
 | `ddhub_register(id, node, event, priority, callback, arg1, arg2, arg3)` | Register an intrusive subscription |
-| `ddhub_unregister(node)` | Unlink a subscription and make it reusable |
+| `ddhub_unregister(node)` | Unregister a subscription and make its node reusable |
 | `ddhub_set_process_done(id, done)` | Configure one hub's completion callback |
 | `ddhub_send(id, event, data, len, done_arg)` | Enqueue a borrowed descriptor without invoking user callbacks |
 | `ddhub_process(id)` | Consume the specified hub's messages present at batch entry |
@@ -233,29 +232,21 @@ Pointees remain mutable. Every consumer of a message shares the original `data` 
 can observe earlier modifications. The three subscriber contexts are supplied at registration;
 `done_arg` is provided per message. Applications own all context lifetimes.
 
-`void * const` constrains local pointer parameters in the callback implementation, while allowing changes
-to pointed-to structure members. Top-level const in a function-pointer type does not force the callback
-definition to retain that qualifier. Repeat const in the callback definition to reject local pointer reassignment.
-Pointers are passed by value, so reassigning a local parameter does not change the caller's pointer variable.
+`void * const` describes a local pointer parameter, not a read-only payload. Pointees remain mutable,
+and top-level const in the callback typedef does not enforce the callback definition's local qualifiers.
+Pointers are passed by value; reassigning a local parameter does not change the caller's pointer variable.
 
 ## Processing scope and concurrency
 
-`ddhub_process(id)` reserves that hub's processing rights and metadata protection before capturing the batch quota.
-`ddhub_process_all()` selects hubs that are neither processing nor holding a metadata reservation,
-captures all selected queues' counts, and releases their metadata reservations within one entry critical section.
-Busy hubs are skipped without changing their queues, quotas, or processing rights.
-Callbacks start only after all selected snapshots are captured, in enumeration order.
-A skipped hub is not revisited even if it becomes idle; another caller may process it independently.
-Messages enqueued to selected hubs after the snapshot wait for the next batch, including publications
-from consumer or completion callbacks. There is no global publication ordering across hubs.
-
-Each object's `fifo` groups `head`, `count`, `pending`, and the static `msg` array.
-`count` is the live queue size; `pending` is the batch quota, decremented for each dequeue.
-Dequeue decreases both counters, while sending increases only `count`, so new messages cannot enlarge the current batch.
-At exit, discard any unused batch quota; remaining messages stay queued and receive a fresh quota on the next call.
+`ddhub_process(id)` consumes only the specified hub's messages queued when the batch begins.
+`ddhub_process_all()` selects available hubs and captures their queued message counts before invoking any callbacks.
+Busy hubs are skipped; selected hubs are processed in enumeration order.
+A skipped hub is not revisited by that ALL call even if it becomes idle, but another caller may process it independently.
+Messages published after the snapshot wait for the next batch, including messages sent by callbacks.
+Ordering is FIFO within each hub; there is no global publication order across hubs.
 
 Only one ALL call may execute at a time. A second ALL call immediately returns busy without consuming messages.
-Skipping any hub, or defensive detection of a queue reservation conflict, makes the final result busy,
+Skipping any hub, or encountering a busy hub during processing, makes the final result busy,
 but other selected hubs continue processing. Thus busy can accompany partial consumption of several hubs.
 Use per-message completion notifications to determine buffer reuse, then retry processing remaining messages later.
 
@@ -271,11 +262,11 @@ ALL freezes only its selected hubs until the whole ALL call returns.
 | API | Across different hubs | Same-hub or shared-node restrictions |
 | --- | --- | --- |
 | register | Distinct nodes can register independently | Same-hub contention is busy; one node cannot belong to two hubs |
-| unregister | Nodes unlink independently according to their current owners | Resolve ownership and reserve the hub together; callers keep nodes valid |
-| send | FIFOs are independent; platform exclusion serializes brief descriptor updates | An unfinished list operation can cause busy; a full FIFO rejects the message; the adapter may wait |
+| unregister | Distinct nodes can be removed from different hubs | The target hub must be available; callers keep nodes valid through concurrent operations |
+| send | Each hub has an independent FIFO | An unavailable hub returns busy; a full FIFO rejects the message; the platform adapter may wait |
 | set_process_done | Idle hubs may be configured independently | Queue must be empty and hub idle; ALL freezes selected hubs only |
 | process | Different hubs and a skipped hub can process alongside ALL | One processor per hub; ALL-selected hubs reject another processor |
-| process_all | Skip hubs processing or holding metadata reservations; consume the others | Only one ALL call; skipped/conflicting hubs cause busy without stopping the others |
+| process_all | Skip hubs busy with processing or another operation; consume the others | Only one ALL call; skipped/conflicting hubs cause busy without stopping the others |
 | set_lock_ops | Bind once during serialized startup | No concurrent first binding or runtime replacement |
 
 Callbacks and completion notifications execute outside the platform and object locks.
@@ -285,48 +276,13 @@ A single-hub callback may call ALL: ALL skips that hub and processes other avail
 Calling ALL from an ALL callback is busy. Processing a hub selected by ALL is also busy;
 an omitted hub may be processed once idle.
 
-Internal helpers consistently manage object reservations and processing state:
-`try_hub_lock()` / `release_hub_lock()`, `hub_is_processing()`, and
-`try_hub_processing()` / `release_hub_processing()`.
-Their callers must already hold platform exclusion; the helpers never reacquire it.
-Processing admission reserves both the processing right and metadata protection in the same critical section.
-
-Enqueue, dequeue, and completion configuration acquire the object reservation, perform their fixed-size update,
-and release the reservation in one platform critical section.
-Registration reserves the hub, checks processing state, and claims node ownership at entry,
-then traverses and inserts into the list outside platform exclusion.
-Unregistration unlinks outside the critical section, then combines publication of node availability
-with releasing the object's reservation.
-The per-hub bool reservation protects these longer list operations; different hubs' traversals and callbacks can overlap.
-Platform exclusion also protects node ownership, processing flags, `process_by_all`, and the global ALL activity flag.
-`process_by_all` identifies the hubs owned by that ALL call so cleanup does not clear another processor's state.
-Brief FIFO updates and shared control state are serialized, but list traversal and callbacks are not.
-Processing cleanup does not depend on other hubs' metadata activity.
-
-Normal-path platform acquisition counts follow. One acquisition means one paired platform lock/unlock;
-N is the number of messages dequeued, excluding additional calls made by user callbacks:
-
-| Operation | Platform critical sections |
-| --- | --- |
-| send | 1 |
-| One message dequeue | 1 |
-| set_process_done | 1 |
-| register / unregister | 2 |
-| process / process_all | 2 + N: admission/snapshot, individual dequeues, and cleanup |
-
-Helpers add no platform calls. Business callbacks and completion notifications run outside both locks;
-`processing` retains batch ownership only. Descriptor transactions release the bool reservation before
-leaving exclusion, so a producer paused after enqueue cannot obstruct an already admitted consumer batch.
-
-Object reservation conflicts immediately return busy. The core never waits, sleeps, or spins;
-whether the injected platform lock waits depends on the adapter. End-to-end nonblocking behavior requires
-a nonblocking adapter. Handle retryable statuses without spinning indefinitely in a context that prevents
-the lock owner from running.
+An unavailable hub returns `DDHUB_BUSY`, which can be retried later.
+Whether an API call can wait depends on the platform adapter; nonblocking use needs a nonblocking adapter.
 
 The same callback function may execute concurrently for different hubs. Applications synchronize shared mutable
 data/contexts and preserve their lifetimes; different IDs alone do not make business data independent.
 
-Dequeue retains a defensive object-reservation check. If processing returns busy partway through,
+If processing returns busy partway through,
 completed messages are neither rolled back nor replayed, and unconsumed messages remain intact.
 The next processing call starts with the remaining queue. Completion notifications identify reusable payloads.
 
@@ -356,7 +312,7 @@ an even longer lifetime.
 | --- | --- | --- |
 | `DDHUB_OK` | 0 | Success, including processing an empty FIFO |
 | `DDHUB_INVALID` | -1 | Invalid ID, zero event, NULL node/callback, or NULL data with positive length |
-| `DDHUB_BUSY` | -2 | Object reservation conflict, processing conflict, or modification of an active hub |
+| `DDHUB_BUSY` | -2 | Target hub is busy, processing overlaps, or an active hub cannot be modified |
 | `DDHUB_QUEUE_FULL` | -3 | Destination FIFO is full; message was not accepted |
 | `DDHUB_ALREADY_REGISTERED` | -4 | Node already belongs to a hub |
 | `DDHUB_NOT_REGISTERED` | -5 | Node is unregistered and cannot be unlinked |
@@ -460,40 +416,3 @@ ddhub_status_t example_tick(uint32_t next_value)
 For immediate dispatch, call `ddhub_process(DDHUB_DEFAULT)` after successful send.
 That call also consumes any earlier queued messages in the entry snapshot.
 On busy, an accepted message may still await another processor; the processing status alone does not permit early reuse.
-
-## Validation
-
-The component's `tests/` uses a separate three-hub, three-slot configuration without changing firmware settings.
-From the ddhub repository root:
-
-```powershell
-cmake -G Ninja -S tests -B build/tests
-cmake --build build/tests
-ctest --test-dir build/tests --output-on-failure
-```
-
-From the parent firmware project's root, its complete host suite remains available:
-
-```powershell
-cmake -G Ninja -S tests/unit -B build/unit-ninja
-cmake --build build/unit-ninja
-ctest --test-dir build/unit-ninja --output-on-failure
-```
-
-`ddhub_behavior_test` checks stable priorities, all 32 event bits, mutable pointees, FIFO fullness and wraparound,
-ALL snapshots, nested ALL from a single-hub callback, subscription timing, callback publication, completion,
-and payload reuse. Acquisition counters verify short transaction and batch lock costs.
-
-`ddhub_concurrency_test` uses real threads and blocked callbacks to verify same-hub exclusion, parallel hubs,
-busy-hub skipping, selected-hub exclusion, independent cleanup, and deferred messages after concurrent publication.
-Four producers submit 2000 messages to check per-producer FIFO order, context routing, callback order,
-and exactly-once completion.
-The adapter verifies each acquisition token and uses thread-local state to ensure callbacks run outside exclusion.
-Controlled pauses cover object reservation isolation, parallel registration, shared-node contention,
-and node transfer during unregistration.
-Stress completion counters belong to one processor; controlled tests use separate per-hub counters inspected
-after the corresponding thread completes. Tests call no atomic APIs. pthread belongs only to host-test adapters.
-
-The parent firmware uses its existing `local-debug` CMake preset. The component remains integrated through
-the components CMake hierarchy; business code must register subscriptions and publish messages explicitly.
-ddhub does not alter existing application data paths automatically.

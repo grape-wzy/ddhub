@@ -10,21 +10,27 @@ ddhub 是 **Data Dispatch Hub** 的缩写，中文为**数据分发中心**：Da
 
 - [使用说明](docs/usage.zh-CN.md)：接口、平台锁移植、并发规则及数据生命周期。
 - [平台示例](examples/README.zh-CN.md)：Linux、Windows、STM32 裸机工程，共用双 hub、四回调演示。
-- `tests/`：行为测试、平台锁次数检查及多线程并发测试，可独立构建，也接入工程主机测试。
+- `tests/`：组件自动化测试。
 - `include/`、`src/`：公共头文件、用户配置及组件实现。
 
-全部 C 源码和头文件（包括示例及测试）采用英文注释。所有说明文档分别提供英文和简体中文版本，
-文件头统一标明 0.1.0 版本及首次发布说明。
+## 功能特性
 
-独立运行组件测试（在 ddhub 仓库根目录执行）：
+- 每个 hub 拥有独立的静态 FIFO，订阅节点由业务提供。
+- 使用 32 位事件掩码订阅，每条消息对每条匹配订阅调用一次回调，传入事件交集。
+- 数值越小优先级越高，同优先级按注册顺序执行。
+- `send()` 将借用的数据指针入队，`process()` 执行分发，完成通知提示数据可复用。
+- 不同 hub 可并行处理，`process_all()` 处理空闲对象并跳过忙对象。
+- 平台锁适配支持 Linux、Windows 和 STM32 裸机接入，C++ 调用方可使用公共 C 接口。
+
+## 构建与使用
+
+独立构建静态库（在 ddhub 仓库根目录执行）：
 
 ```sh
-cmake -G Ninja -S tests -B build/tests
-cmake --build build/tests
-ctest --test-dir build/tests --output-on-failure
+cmake -G Ninja -S . -B build/library
+cmake --build build/library
 ```
 
-主机测试使用 pthread：Linux 可直接使用系统线程库，Windows 可使用带 pthread 的 MinGW 工具链。
-Windows 原生示例独立使用 Win32 SRWLOCK，不依赖 pthread。
-
-组件不使用堆内存，不调用标准原子接口或编译器原子接口。其他 ddhub 操作开始前，先一次性绑定平台 lock/unlock。
+其他 CMake 工程可使用 `add_subdirectory(path/to/ddhub)` 引入，再将应用目标链接到 `ddhub`。
+其他 ddhub 操作开始前，先一次性绑定平台 lock/unlock。
+配置方式见[使用说明](docs/usage.zh-CN.md)，完整演示见[平台示例](examples/README.zh-CN.md)。

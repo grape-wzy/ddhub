@@ -39,7 +39,7 @@ Expected output from the Windows example follows. Other platforms replace only t
 [Windows] source=alarm_monitor message="alarm=clear" hub=CONTROL callback=on_alarm event=0x00000008
 ```
 
-Run the following commands from the ddhub repository root. In the parent firmware project, first enter `components/ddhub/`.
+Run the following commands from the ddhub repository root.
 
 ## Linux
 
