@@ -10,6 +10,11 @@ target_include_directories(ddhub_example_core PUBLIC
 target_compile_definitions(ddhub_example_core PUBLIC
     DDHUB_CONFIG_HEADER="ddhub_example_config.h")
 
+if(DEFINED DDHUB_ASYNC_PROCESS_ENABLE)
+    target_compile_definitions(ddhub_example_core PUBLIC
+        DDHUB_ASYNC_PROCESS_ENABLE=$<BOOL:${DDHUB_ASYNC_PROCESS_ENABLE}>)
+endif()
+
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(ddhub_example_core PRIVATE -Wall -Wextra -Werror -Wpedantic)
 elseif(MSVC)

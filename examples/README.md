@@ -3,7 +3,7 @@
 English | [Simplified Chinese](README.zh-CN.md)
 
 **ddhub = Data Dispatch Hub**, a data distribution center.
-Version **0.1.0**: **Initial version; first release**.
+Version **0.2.0**: **Sync/async dispatch, global notification, and live subscriptions**.
 
 The three platform projects share the business code and configuration in `common/` without changing
 the component's default configuration:
@@ -24,11 +24,13 @@ examples/
 | `EXAMPLE_HUB_CONTROL` | `EVENT_ALARM`, bit 3 | `on_alarm` | `alarm_monitor` | `alarm=clear` |
 
 After binding the platform lock adapter, call `ddhub_example_run()` once. It registers four static nodes,
-publishes four static messages, calls `ddhub_process(EXAMPLE_HUB_SENSOR)`, then uses `ddhub_process_all()`
-to consume the other hub's messages, and finally unregisters the nodes.
-The demonstration runs in the calling thread or main loop; it creates no worker threads.
-Message sources are business publisher labels. Nodes and payloads have static storage and require no heap allocation.
-The platform adapter still provides exclusion for later concurrent use.
+publishes four static messages, calls `ddhub_process()` once in asynchronous mode, and unregisters the nodes.
+Synchronous mode dispatches each message directly in send and compiles out the process call.
+The example uses polling on the calling thread/main loop and creates no worker threads.
+Nodes and payloads use static storage. See the usage guide for global notification and RTOS binary-wakeup integration.
+
+Set `-DDDHUB_ASYNC_PROCESS_ENABLE=0` in a separate example build directory to exercise synchronous mode;
+the CMake definition propagates to both the component and its callers.
 
 Expected output from the Windows example follows. Other platforms replace only the bracketed platform label:
 

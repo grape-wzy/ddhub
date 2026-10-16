@@ -3,15 +3,17 @@
  * @brief Run the two-hub logging example on Linux.
  * @details ddhub stands for Data Dispatch Hub, an event-driven data distribution center.
  *          Bind a static pthread mutex adapter and print the shared four-event demonstration to the console.
- * @version 0.1.0
+ * @version 0.2.0
  * @date 2026-10-15 (development date)
  *
  * @par Release notes
+ * 0.2.0: Dispatch modes, global notification, draining, and live subscriptions.
  * 0.1.0: Initial version; first release.
  *
- * @par Modification history
- * - Codex 2026-10-15: Add the Linux lock adapter and example entry point.
- * - Codex 2026-10-15: Prepare version 0.1.0 with English source documentation.
+ * @par 修改记录
+ * - Codex 2026-10-15：Add the Linux lock adapter and example entry point.
+ * - Codex 2026-10-15：Prepare version 0.1.0 with English source documentation.
+ * - Codex 2026-10-16：Release version 0.2.0.
  */
 
 #include "ddhub.h"

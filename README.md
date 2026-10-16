@@ -2,12 +2,13 @@
 
 English | [Simplified Chinese](README.zh-CN.md)
 
-Version: **0.1.0**. Release notes: **Initial version; first release**.
+Version: **0.2.0**. Release notes: **Sync/async dispatch, global notification, and live subscriptions**.
 
 **ddhub** stands for **Data Dispatch Hub**, a data distribution center: **Data** is the payload,
 **Dispatch** routes messages to interested callbacks, and **Hub** is the central coordination point.
 It is a C99 component with static storage, intrusive subscription nodes, and event-bitmask dispatch.
 
+- [Changelog](CHANGELOG.md): release notes and migration instructions.
 - [User guide](docs/usage.md): APIs, platform lock adapters, concurrency rules, and payload lifetime.
 - [Platform examples](examples/README.md): Linux, Windows, and STM32 bare-metal projects sharing two hubs and four callbacks.
 - `tests/`: automated component tests.
@@ -15,11 +16,12 @@ It is a C99 component with static storage, intrusive subscription nodes, and eve
 
 ## Features
 
-- Each hub has an independent static FIFO and application-owned subscription nodes.
+- Each asynchronous hub has an independent static FIFO; subscription nodes are application-owned in both modes.
 - Subscriptions use 32-bit event masks; each matching subscription invokes its callback once with the event intersection.
 - Lower numerical priorities run first, with registration order preserved for equal priorities.
-- `send()` queues a borrowed payload; `process()` dispatches it and a completion callback signals when it can be reused.
-- Different hubs can process concurrently; `process_all()` processes available hubs and skips busy ones.
+- `DDHUB_ASYNC_PROCESS_ENABLE` selects direct synchronous send or queued asynchronous `process()` dispatch.
+- Async mode uses one global draining consumer and an optional scheduling hook; sync sends can dispatch different hubs concurrently.
+- Live registration takes effect from the next message; only the active subscription is protected from removal.
 - Platform lock adapters support Linux, Windows, and STM32 bare-metal integration; C++ callers can use the C API.
 
 ## Build and use
@@ -33,5 +35,5 @@ cmake --build build/library
 
 Other CMake projects can use `add_subdirectory(path/to/ddhub)` and link their application target to `ddhub`.
 Bind platform lock/unlock callbacks once before any other ddhub operation.
-See [CMake integration](docs/usage.md#cmake-integration) for configuration and the
+See [configuration and build](docs/usage.md#configuration-and-build) for configuration and the
 [platform examples](examples/README.md) for complete demonstrations.

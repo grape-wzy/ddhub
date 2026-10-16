@@ -1,399 +1,153 @@
-# ddhub 数据分发中心
+# ddhub 使用说明
 
 [English](usage.md) | 简体中文
 
-版本：**0.1.0**；说明：**初版，首次发布**。
+ddhub（Data Dispatch Hub，数据分发中心）是静态内存、侵入式订阅节点、借用 payload 的 C99 组件，公共头支持 C++。
 
-ddhub 是 **Data Dispatch Hub** 的缩写：Data（数据）+ Dispatch（分发）+ Hub（中心），即数据分发中心。
+## 配置与构建
 
-ddhub 是可移植的 C99 组件，对象和消息队列使用静态存储。
-业务提供侵入式订阅节点和平台锁适配，消息通过借用的数据指针传递，并按事件分发给订阅者，无需动态分配。
-C++ 应用可以使用公共 C 接口，并链接以 C 编译的实现。
+在 `ddhub_config.h` 或统一选择的 `DDHUB_CONFIG_HEADER` 中定义连续的 `ddhub_id_t`，实际 hub 从 0 开始，在 `DDHUB_ID_COUNT` 前添加。所有编译单元必须使用相同配置。
 
-## 文件与配置
+| 配置 | 默认值 | 含义 |
+|---|---|---|
+| `DDHUB_ASYNC_PROCESS_ENABLE` | `1` | `1` 为发送入队、统一 process；`0` 为 send 直接分发 |
+| `DDHUB_FIFO_DEPTH` | `8` | 异步模式每 hub 的等待队列容量，必须大于零 |
+| `DDHUB_CONFIG_HEADER` | `"ddhub_config.h"` | 构建级用户配置头 |
 
-组件文件：
-
-- `include/ddhub.h`：节点、回调类型、平台锁类型、状态码和七个公开操作。
-- `include/ddhub_config.h`：用户对象枚举和 FIFO 容量。
-- `src/ddhub.c`：订阅管理、静态 FIFO 和事件分发。
-- `docs/`：本使用说明。
-- `tests/`：组件自动化测试。
-- `examples/`：[Linux、Windows 和 STM32 裸机示例](../examples/README.zh-CN.md)。
-
-在 `ddhub_config.h` 中修改 `ddhub_id_t`，实际对象从 0 开始连续编号，在 `DDHUB_ID_COUNT` 之前添加。
-遍历全部对象调用 `ddhub_process_all()`，对象数量不受事件位图的 32 位限制。
-
-`DDHUB_FIFO_DEPTH` 指定每个对象独立的 FIFO 容量，必须大于 0，默认 8 条。
-FIFO 只保存 `event/data/len/done_arg`，不复制 data 内容。容量不包含已经出队、正在执行回调的一条消息。
-总静态消息存储随 `DDHUB_ID_COUNT * DDHUB_FIFO_DEPTH` 增长，订阅数量由业务提供的节点数量决定。
-
-需要在其他工程或测试中使用另一份配置时，可统一定义
-`DDHUB_CONFIG_HEADER="my_ddhub_config.h"`。所有使用 ddhub 的编译单元必须使用相同配置。
-默认配置提供一个通用对象 `DDHUB_DEFAULT`，没有自动注册业务回调。
-
-## CMake 接入
-
-在仓库根目录构建 `ddhub` C99 静态库：
+同步构建不包含 FIFO 存储，也不声明或导出 `ddhub_process()`、`ddhub_set_process_notify()`。本次接口调整移除了带 ID 的 process 和独立的 process_all。
 
 ```sh
 cmake -G Ninja -S . -B build/library
 cmake --build build/library
+cmake -G Ninja -S . -B build/library-sync -DDDHUB_ASYNC_PROCESS_ENABLE=0
+cmake --build build/library-sync
+cmake -G Ninja -S tests -B build/tests
+cmake --build build/tests
+ctest --test-dir build/tests --output-on-failure
 ```
 
-其他 CMake 工程可这样接入：
+父工程通过 `add_subdirectory(path/to/ddhub)` 和 `target_link_libraries(app PRIVATE ddhub)` 接入。自定义配置使用 PUBLIC 包含路径及 `DDHUB_CONFIG_HEADER="my_config.h"` 编译定义。只有显式设置 CMake 变量 `DDHUB_ASYNC_PROCESS_ENABLE` 时，构建系统才通过 PUBLIC 定义覆盖配置头默认值。
 
-```cmake
-add_subdirectory(path/to/ddhub)
-target_link_libraries(my_application PRIVATE ddhub)
-```
+## 平台互斥
 
-应用使用自定义配置头时，由父工程添加其包含路径和编译定义：
-
-```cmake
-target_include_directories(ddhub PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/config")
-target_compile_definitions(ddhub PUBLIC DDHUB_CONFIG_HEADER="my_ddhub_config.h")
-```
-
-库和使用方共享所选配置，目标平台的编译参数通过应用工具链设置。
-
-## 平台锁移植
-
-启动时，在其他 ddhub 操作及并发调用开始之前配置一次：
+在串行启动阶段、任何其他操作之前绑定一次：
 
 ```c
-typedef uintptr_t ddhub_lock_key_t;
-typedef ddhub_lock_key_t (*ddhub_lock_t)(void);
-typedef void (*ddhub_unlock_t)(ddhub_lock_key_t key);
-
 ddhub_status_t ddhub_set_lock_ops(ddhub_lock_t lock, ddhub_unlock_t unlock);
 ```
 
-lock 进入互斥区域并返回本次操作的状态值，unlock 在同一执行上下文中原样接收该值。
-中断适配可用它恢复之前的屏蔽状态，不需要恢复状态的适配器可以返回 0。
+lock 必须成功取得互斥，返回本次获取专属的 `uintptr_t` token；unlock 在相同上下文恢复 token。适配器共同提供 acquire/release 内存顺序，不能重入 ddhub。未绑定时有效操作返回 NOT_READY，重复绑定返回 BUSY。
 
-适配器为所有支持的调用上下文提供互斥和内存可见性，加锁需要成功，lock/unlock 回调不能重入 ddhub。
-中断调用使用支持中断上下文的适配器，多核调用使用跨核同步机制。
-业务回调和完成通知均在平台临界区外执行。
+线程、ISR、多核支持由适配器决定。单核 Cortex-M 可以保存、屏蔽、恢复中断；普通桌面线程可以使用互斥锁。回调、完成通知、全局通知都在锁外执行。
 
-空函数指针返回 `DDHUB_INVALID`。未绑定时，有效的注册、注销、通知配置、发送及处理请求返回
-`DDHUB_NOT_READY`。绑定仅允许在串行启动阶段执行一次，重复绑定返回 `DDHUB_BUSY`，
-以避免运行期间更换同步域。平台绑定不清空对象、节点或队列。
-
-Zephyr 适配示例：
-
-```c
-#include "ddhub.h"
-#include <zephyr/irq.h>
-
-/**
- * @brief Save interrupt state and enter platform exclusion.
- * @return Interrupt-state token for this acquisition.
- */
-static ddhub_lock_key_t platform_irq_lock(void)
-{
-    return (ddhub_lock_key_t)irq_lock();
-}
-
-/**
- * @brief Restore the interrupt state saved by the corresponding entry.
- * @param key Per-acquisition interrupt-state token.
- */
-static void platform_irq_unlock(ddhub_lock_key_t key)
-{
-    irq_unlock((unsigned int)key);
-}
-
-/**
- * @brief Bind the board adapter once from serialized startup code.
- * @return ddhub binding status.
- */
-ddhub_status_t example_bind_irq_lock(void)
-{
-    return ddhub_set_lock_ops(platform_irq_lock, platform_irq_unlock);
-}
-```
-
-该适配保存并恢复原来的中断状态，支持正确的嵌套，避免退出时无条件开中断。
-不受 IRQ 锁屏蔽的中断不能并发访问同一份 ddhub 状态。
-
-Linux/POSIX 线程适配示例：
-
-```c
-#include "ddhub.h"
-#include <pthread.h>
-#include <stdlib.h>
-
-static pthread_mutex_t platform_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-/**
- * @brief Enter the process-wide metadata exclusion region.
- * @return Zero, because a pthread mutex needs no restoration token.
- */
-static ddhub_lock_key_t platform_mutex_lock(void)
-{
-    if (pthread_mutex_lock(&platform_mutex) != 0) {
-        abort();
-    }
-    return 0;
-}
-
-/**
- * @brief Leave the matching process-wide exclusion region.
- * @param key Unused token returned by platform_mutex_lock().
- */
-static void platform_mutex_unlock(ddhub_lock_key_t key)
-{
-    (void)key;
-    if (pthread_mutex_unlock(&platform_mutex) != 0) {
-        abort();
-    }
-}
-
-/**
- * @brief Bind the POSIX adapter once before starting workers.
- * @return ddhub binding status.
- */
-ddhub_status_t example_bind_mutex_lock(void)
-{
-    return ddhub_set_lock_ops(platform_mutex_lock, platform_mutex_unlock);
-}
-```
-
-该示例使用 pthread 互斥锁，锁操作失败时终止进程。
-
-## 订阅与事件
-
-业务声明长期有效的节点：
-
-```c
-static ddhub_subscription_t subscription;
-```
-
-静态零初始化使节点处于未注册状态。一个节点同时只能属于一个对象；不同节点可以使用同一个回调。
-注册期间节点字段由 ddhub 管理，业务不能修改、复制或重新初始化节点。
-注销成功后节点可以复用。
-修改事件、优先级、回调或 arg 时，先注销再注册。
-
-不同对象使用不同节点时，可从多个线程并发注册和注销。
-在 A 上注册或注销不会让 B 变忙；同一对象的操作发生冲突时，返回 `DDHUB_BUSY`。
-
-并发注册不能将同一个节点挂入两个对象。业务协调节点的复用和生命周期，
-使其保持有效直到注销成功，且所有引用它的并发操作均已返回。
-
-每个对象有自己的 `uint32_t` 事件位图，各 bit 含义由用户定义。
-注册和发送的事件掩码都不能为 0，包含 bit 31 在内的全部 32 位均可使用。
-
-对每条订阅计算：
-
-```c
-matched = published_event & subscribed_event;
-```
-
-`matched != 0` 时调用一次回调，传入 matched。命中多个 bit 也只调用一次。
-事件不累计、不锁存；不同消息不合并。消息之间保持对象内部的 FIFO 顺序。
-
-注册参数 `uint8_t priority` 越小越先调用，范围为 0～255。同优先级按注册顺序调用，
-注销后重新注册的节点排到同优先级节点末尾。
+排序查找在平台锁外用每 hub 写者标志串行化。链接提交、消息描述符操作、活动节点选择和推进在平台锁内进行。选择下一节点可能扫描跳过不匹配或本条消息开始后注册的节点；注册序号耗尽时也在锁内重排序号。临界区不会复制 payload 或调用业务代码，其耗时受订阅数量影响。
 
 ## 公开接口
 
-| 操作 | 用途 |
-| --- | --- |
-| `ddhub_set_lock_ops(lock, unlock)` | 启动时一次性绑定平台互斥操作 |
-| `ddhub_register(id, node, event, priority, callback, arg1, arg2, arg3)` | 注册侵入式订阅节点 |
-| `ddhub_unregister(node)` | 注销订阅并允许复用节点 |
-| `ddhub_set_process_done(id, done)` | 配置对象的完成通知函数 |
-| `ddhub_send(id, event, data, len, done_arg)` | 保存消息描述并返回，不调用业务回调 |
-| `ddhub_process(id)` | 处理所选对象本轮已有消息 |
-| `ddhub_process_all()` | 处理空闲对象本轮已有消息，跳过忙对象 |
+| 接口 | 用途 |
+|---|---|
+| `ddhub_set_lock_ops(lock, unlock)` | 一次性配置平台互斥 |
+| `ddhub_register(id, node, event, priority, callback, arg1, arg2, arg3)` | 注册调用方提供的节点 |
+| `ddhub_unregister(node)` | 安全摘除非活动节点 |
+| `ddhub_set_process_done(id, done)` | 在 hub 空闲且队列为空时配置完成函数 |
+| `ddhub_send(id, event, data, len, done_arg)` | 按编译模式直接分发或入队 |
+| `ddhub_set_process_notify(notify)` | 仅异步：启动阶段一次性绑定全局调度通知 |
+| `ddhub_process()` | 仅异步：单消费者统一排空所有 hub |
 
-业务回调类型：
+ID 必须在 `[0, DDHUB_ID_COUNT)`。事件掩码不能为零，全部 32 位都可使用。`len > 0` 要求 data 非空；零长度允许 NULL。消费回调非空，其他上下文及 done 可以为空。
 
-```c
-typedef void (*ddhub_callback_t)(uint32_t event, void * const data, size_t len,
-                                void * const arg1, void * const arg2, void * const arg3);
+## 同步发送
 
-typedef void (*ddhub_process_done_t)(ddhub_id_t hub_id, uint32_t event,
-                                    void * const data, size_t len, void * const arg);
-```
+`DDHUB_ASYNC_PROCESS_ENABLE=0` 时，send 在调用者上下文直接分发目标 hub，完成回调返回后 send 才成功返回。同步 send 不使用 FIFO。
 
-所有指针所指内容均可修改。同一消息的所有订阅回调共享原始 data，后执行的回调可以看到先前的修改。
-三个 arg 在注册时提供，done_arg 按消息提供。所有上下文都由调用方维护生命周期。
+同一 hub 已在分发时，再次发送返回 BUSY；其他空闲 hub 可以分发，可能在不同线程中并行执行。A → B → A 的递归在再次发送到 A 时返回 BUSY。完成函数在处理期间不能替换。
 
-`void * const` 描述局部指针形参，不表示数据只读，所指内容仍可修改。
-回调 typedef 中的顶层 const 不会强制回调定义保留相同的局部限定符。
-指针按值传递，局部形参重新赋值不会修改调用方的指针变量。
+同步回调继承发送者上下文。**从 ISR 发送推荐开启异步模式，以缩短中断处理时间。** 如选择同步 ISR 发送，全部订阅与完成回调都必须支持 ISR 上下文。
 
-## 处理范围与并发
+## 异步发送、通知与排空
 
-`ddhub_process(id)` 只处理指定对象在本轮开始时已经排队的消息。
-`ddhub_process_all()` 选择空闲对象，在执行任何回调前记录这些对象的待处理消息数量，再按枚举顺序分发。
-忙对象直接跳过，即使它随后空闲，本次 ALL 也不会重新选择；其他调用可以独立处理它。
-快照之后发送的消息留待下一轮，包括回调中新发出的消息。
-同一对象内部保持 FIFO 顺序，对象之间不保证全局发送顺序。
+异步 send 只保存 `event/data/len/done_arg` 描述符，不复制 payload。每 hub FIFO 独立，容量不包含已出队、正在回调的消息。满时返回 QUEUE_FULL，不接受消息。链表写者不阻挡发送和出队。
 
-同时只允许一个 `ddhub_process_all()` 执行；另一个 ALL 调用立即返回 busy，不消费消息。
-任一对象被跳过，或处理中遇到忙状态，最终返回 busy，
-但其余选中对象仍继续处理。因此 busy 可以伴随部分甚至多个对象的消息消费，
-应依靠逐消息完成通知判断数据何时可以复用，之后再次调用处理接口重试剩余消息。
+全库只有一个消费执行者。`ddhub_process()` 不等待消息；按轮处理各 hub 的有限当前批次，再复查新消息，直到全部排空。回调和 done 中发送的新消息也在本次调用继续处理。持续发送可能使 process 长期不返回。
 
-例如线程 1 正在 `ddhub_process(A)`，线程 2 调用 `ddhub_process_all()`：
-ALL 跳过 A，处理空闲的 B、C，最终返回 busy。A 完成后，即使 ALL 尚未结束，
-其他调用也可以再次处理 A；ALL 结束时仅释放它选中对象的处理权。
+并发或递归 process 返回 BUSY。OK 表示最终锁内检查时全部队列为空，并已在同一临界区释放处理权；之后新发送的消息由后续调用处理。因此不能推断调用者实际观察到返回值时队列仍为空。各 hub 内按 FIFO，不保证跨 hub 的全局发送顺序。
 
-处理开始前的注册、注销会影响本轮接收者。例如 send 成功后注销 A、注册 B，之后 process 时
-由 B 按事件匹配接收。指定对象的整批处理期间，该对象订阅链表和完成通知函数保持稳定。
-全对象处理的整批期间，仅选中对象的订阅链表和完成通知函数保持稳定。
+通知类型为 `void (*)(void)`，所有成功的 send 调用同一个全局通知，不传 hub ID。注册、注销释放写者后，如果队列仍有消息，也可以补发相同通知。通知在解锁后、发送者或写者上下文执行，适配器必须支持实际的线程/ISR 上下文。
 
-| 接口 | 不同对象的并发 | 同对象或共享节点的限制 |
-| --- | --- | --- |
-| register | 不同对象使用不同节点可同时注册 | 同对象操作冲突返回 busy；同一节点不能同时归属多个对象 |
-| unregister | 不同对象可以独立注销各自节点 | 目标对象需要可用；节点保持有效直到引用它的并发操作结束 |
-| send | 每个对象拥有独立 FIFO | 目标对象暂不可用时返回 busy，满时返回 queue full；平台适配器可能等待 |
-| set_process_done | 可分别配置空闲对象 | 目标 FIFO 必须为空且未处理；ALL 仅冻结选中对象的配置 |
-| process | 不同对象可同时执行回调，也可与跳过本对象的 ALL 并行 | 同一对象只允许一个处理调用；被 ALL 选中的对象返回 busy |
-| process_all | 跳过正在处理或被其他操作占用的对象，继续处理其他对象 | 同时只有一个 ALL；跳过或遇到忙状态时返回 busy，其余对象继续处理 |
-| set_lock_ops | 启动阶段串行配置一次 | 不支持并发首次绑定或运行期更换同步域 |
+通知在绑定锁之后、并发使用之前一次性配置；未配置或绑定 NULL 可用于轮询。配置后不能更换。通知用于安排后续 process，不应依赖在通知中递归 process 完成排空。
 
-回调和完成通知在内部对象锁、平台临界区之外执行，因此回调可以 send 同一对象，
-也可以操作其他空闲对象。当前处理对象的 register/unregister/set_process_done 返回 busy，
-递归 process 当前对象也返回 busy。单对象回调中可以调用 ALL，它跳过当前对象并处理其他空闲对象，
-最终返回 busy。ALL 回调中再次调用 ALL 返回 busy；process 被本轮 ALL 选中的对象也返回 busy，
-而本轮跳过的对象在空闲后仍可独立 process。
+## 平台调用方式
 
-对象暂不可用时返回 `DDHUB_BUSY`，调用方可以稍后重试。
-接口是否可能等待由平台适配器决定；需要非阻塞调用时，使用非阻塞适配器。
+裸机异步模式可以直接从主循环调用 `ddhub_process()`，没有数据就返回，不需要通知钩子。同步模式只调用 send。
 
-同一个回调函数可能在不同对象的处理线程中同时执行。如果不同对象共享可变 data 或 arg，
-业务负责这些内容的并发同步及数据生命周期；不同 hub_id 并不能自动保证业务数据彼此独立。
-
-如果处理中途返回 busy，已经完成的消息不回滚、不重放，
-未消费的消息完整保留在 FIFO。下一次 process 从剩余消息继续，以逐条完成通知判断数据可复用时机。
-
-## 数据生命周期与完成通知
-
-1. send 失败：消息未被接收，不调用完成通知，数据仍完全由发送方持有。
-2. send 成功：发送方保持 data、done_arg 有效，并停止自行改写 data，直至收到完成通知。
-3. 匹配的订阅回调依次执行，可以修改 data 和各自的 arg 所指内容。
-4. 全部匹配回调返回后，调用对象的 done 一次，传入原始事件、原始 data、len、done_arg。
-5. 即使没有匹配的订阅者，也会完成通知。进入 done 后 ddhub 不再访问该消息的数据或生产者上下文，
-   发送方可以释放或复用它们。done 中再次 send 同一个已完成的缓冲区是允许的。
-
-一个对象只有一个 done 函数，可根据 done_arg 区分不同发送方。done 在 process 调用方的上下文中执行。
-done 执行期间仍持有处理权，所以同对象的 process、注册、注销及完成函数更换返回 busy。
-只有 FIFO 为空且对象未处于处理状态时才能更换或清除 done；ALL 期间选中对象的 done 保持不变。
-
-允许 done 为 NULL，此时数据有效期由业务自行保证。未配置通知时，异步发送的临时栈数据通常不能满足该要求。
-订阅节点及三个 arg 必须至少有效到成功注销；其他并发对象仍持有同一上下文时，业务还需要延长其生命周期。
-
-## 返回值与参数边界
-
-| 状态 | 值 | 含义 |
-| --- | --- | --- |
-| `DDHUB_OK` | 0 | 操作成功；处理空 FIFO 也是成功 |
-| `DDHUB_INVALID` | -1 | 无效 ID、零事件、空节点/消费回调、或空 data 配合正长度 |
-| `DDHUB_BUSY` | -2 | 目标对象忙、处理调用重叠，或当前对象不能修改 |
-| `DDHUB_QUEUE_FULL` | -3 | 目标对象 FIFO 已满，消息没有入队 |
-| `DDHUB_ALREADY_REGISTERED` | -4 | 同一节点已经注册到某个对象 |
-| `DDHUB_NOT_REGISTERED` | -5 | 节点未注册，不能注销 |
-| `DDHUB_NOT_READY` | -6 | 尚未绑定平台 lock/unlock |
-
-hub_id 只接受 `[0, DDHUB_ID_COUNT)` 范围内的实际对象编号。`data == NULL && len > 0` 无效；
-len 为 0 时允许 data 为 NULL，
-可用于纯事件。三个 arg、done_arg、done 函数均允许为空。订阅消费函数不可为空。
-
-## 单线程主循环示例
-
-以下示例中的节点、数据和上下文均为静态对象。ready 仅适用于这里的单线程主循环；
-若生产与消费分属不同线程，应按业务并发模型同步这个标志。
+RTOS 可以使用一个能保留通知的二值信号量。以下为 Zephyr 消费线程示意；先提供适合发送上下文的平台锁，再绑定通知，最后启动生产者与唯一消费线程：
 
 ```c
 #include "ddhub.h"
-#include "ddhub_config.h"
-#include <stdbool.h>
-#include <stddef.h>
-#include <stdint.h>
+#include <zephyr/kernel.h>
 
-static ddhub_subscription_t listener;
-static uint32_t received_count;
-static uint32_t sample;
-static bool ready = true;
+K_SEM_DEFINE(hub_wakeup, 0, 1);
+
+/** @brief Arrange processing from a thread or supported ISR. */
+static void process_notify(void)
+{
+    k_sem_give(&hub_wakeup);
+}
 
 /**
- * @brief Count received samples.
- * @param event Matched sample events.
- * @param data Mutable sample buffer.
- * @param len Buffer size in bytes.
- * @param arg1 Mutable reception counter.
- * @param arg2 Unused context.
- * @param arg3 Unused context.
+ * @brief Run the unique asynchronous consumer.
+ * @param arg1 Unused thread context.
+ * @param arg2 Unused thread context.
+ * @param arg3 Unused thread context.
  */
-static void on_sample(uint32_t event, void * const data, size_t len,
-                      void * const arg1, void * const arg2, void * const arg3)
+static void process_thread(void *arg1, void *arg2, void *arg3)
 {
-    (void)event;
-    (void)data;
-    (void)len;
+    (void)arg1;
     (void)arg2;
     (void)arg3;
-    ++*(uint32_t *)arg1;
-}
-
-/**
- * @brief Return the sample buffer to its producer.
- * @param hub_id Consuming hub.
- * @param event Original event mask.
- * @param data Completed buffer.
- * @param len Completed buffer size.
- * @param arg Producer's availability flag.
- */
-static void on_done(ddhub_id_t hub_id, uint32_t event,
-                    void * const data, size_t len, void * const arg)
-{
-    (void)hub_id;
-    (void)event;
-    (void)data;
-    (void)len;
-    *(bool *)arg = true;
-}
-
-/**
- * @brief Set up this example once from application startup code.
- * @details Requires platform lock callbacks to be bound before this function is called.
- * @return ddhub status; continue only after DDHUB_OK.
- */
-ddhub_status_t example_start(void)
-{
-    /* First bind one of the platform adapters above from serialized startup code. */
-    ddhub_status_t status = ddhub_set_process_done(DDHUB_DEFAULT, on_done);
-    if (status != DDHUB_OK) {
-        return status;
+    for (;;) {
+        k_sem_take(&hub_wakeup, K_FOREVER);
+        ddhub_process();
     }
-    return ddhub_register(DDHUB_DEFAULT, &listener, 1U, 10U,
-                          on_sample, &received_count, NULL, NULL);
-}
-
-/**
- * @brief Publish if the buffer is available, then process from the main loop.
- * @param next_value Latest value to publish; ignored while the previous buffer is busy.
- * @return ddhub status; retry transient failures from a later loop iteration.
- */
-ddhub_status_t example_tick(uint32_t next_value)
-{
-    if (ready) {
-        sample = next_value;
-        ready = false;
-        ddhub_status_t status = ddhub_send(DDHUB_DEFAULT, 1U, &sample, sizeof(sample), &ready);
-        if (status != DDHUB_OK) {
-            ready = true;
-            return status;
-        }
-    }
-    return ddhub_process_all();
 }
 ```
 
-需要立即分发时，send 成功后调用 `ddhub_process(DDHUB_DEFAULT)`。它会处理本轮该对象已有的消息，
-可能包含本次消息之前排队的消息。若返回 busy，发送成功的消息仍可能等待其他调用处理，
-不能单凭 process 的返回值提前复用数据。
+启动时调用 `ddhub_set_process_notify(process_notify)` 并检查状态。处理期间的通知可以在排空后仍保留，导致下一次立即醒来做一次空处理；这是允许的。不能在 process 返回后无条件重置信号量，否则可能抹掉最终空检查之后发生的新发送。组件没有 wait/ready 或线程创建接口。
+
+## 动态订阅与生命周期
+
+节点用静态零初始化或 `DDHUB_SUBSCRIPTION_INIT` 初始化。注册后字段归组件管理，不允许修改、复制或重新初始化。一个节点同时只能属于一个 hub；修改订阅参数时先注销再注册。
+
+priority 数值越小越先执行，同优先级按注册顺序。每条消息对订阅掩码计算交集，非零调用一次，传交集；消息不会合并。所有订阅共享同一可变 payload，后执行者可观察前执行者的修改。
+
+**处理期间允许注册，新订阅从下一条消息开始生效，包括同一次 process 中的后续消息。** 同步模式遵循相同消息边界。注册不重放当前消息，也不独立触发回调；每次重新注册取得新序号，仍保持优先级顺序。序号耗尽时保留当前消息的可接收集合后重新编号。
+
+process 只保护仍在使用的活动节点。注销当前节点返回 BUSY；其他节点可以摘除。若在被选中前成功注销，则当前消息也跳过它。活动保护覆盖回调后的最后一次 next 读取，成功注销后调度器不再访问节点。
+
+注册/注销彼此竞争同一 hub 的写者标志时仍可能 BUSY；与处理中的整 hub 冻结不同。不同 hub 的写者可以独立操作。节点及上下文应有效至注销成功且其他持有指针的并发调用全部结束。
+
+## 完成与所有权
+
+send 失败：消息没有被接受，不调用 done，发送者继续拥有 payload。
+
+send 成功：保持 data、done_arg 有效，生产者停止修改 data，直至完成。所有匹配订阅执行完后，done 被调用一次，包括无匹配订阅的情况。done 收到原始 hub、事件、data、len 和 done_arg；此后组件不再访问 payload 或生产者上下文，可以在 done 中释放或复用。
+
+同步 done 在 send 返回前执行。异步 done 在 process 上下文执行，同 hub 的新发送可以再次入队并被本次 process 消费。同步 done 中再次发送同 hub 则 BUSY。done 时没有活动订阅节点，可以注册或注销节点，但 hub 的处理权仍有效，不能替换完成函数。
+
+done 为 NULL 时，数据有效期由应用自行保证。异步发送函数栈上的临时数据通常无法满足消费前的有效期要求。不同 hub 共享的可变业务对象仍需应用同步。
+
+## 返回值
+
+| 状态 | 含义 |
+|---|---|
+| `DDHUB_OK` | 成功；空 process 也是成功 |
+| `DDHUB_INVALID` | ID、事件、节点、消费回调或 data/len 组合无效 |
+| `DDHUB_BUSY` | 链表写者竞争、注销活动节点、重复绑定、重叠处理或同步同 hub 发送 |
+| `DDHUB_QUEUE_FULL` | 仅异步：目标 FIFO 已满 |
+| `DDHUB_ALREADY_REGISTERED` | 节点已注册或被另一次注册预留 |
+| `DDHUB_NOT_REGISTERED` | 节点未注册 |
+| `DDHUB_NOT_READY` | 尚未绑定平台锁 |
+
+## 验证
+
+主机测试同时编译两种模式，覆盖参数、排序、事件交集、FIFO、完成生命周期、动态注册/注销、序号重排、受控线程交错、最终检查后的发送交接、2000 条多生产者消息与二值通知、C++ 互操作，以及同步构建的 API/符号屏蔽。

@@ -3,19 +3,22 @@
  * @brief Declare the portable Data Dispatch Hub API.
  * @details ddhub - Data Dispatch Hub, an event-driven data distribution center.
  *          Define static subscription nodes, event callbacks, completion notifications, and C/C++ platform lock APIs.
- * @version 0.1.0
+ * @version 0.2.0
  * @date 2026-10-14 (development date)
  *
  * @par Release notes
+ * 0.2.0: Dispatch modes, global notification, draining, and live subscriptions.
  * 0.1.0: Initial version; first release.
  *
- * @par Modification history
- * - Codex 2026-10-14: Introduce the static event dispatch API.
- * - Codex 2026-10-15: Add platform lock injection, a separate ALL processing API, and C++ initialization support.
- * - Codex 2026-10-15: Document per-hub concurrency, node ownership contention, and callback reentry.
- * - Codex 2026-10-15: Document busy-hub skipping, partial consumption, and selected-hub exclusion.
- * - Codex 2026-10-15: Document descriptor transactions and list traversal and callbacks outside platform exclusion.
- * - Codex 2026-10-15: Prepare version 0.1.0 with English source documentation.
+ * @par 修改记录
+ * - Codex 2026-10-14： Introduce the static event dispatch API.
+ * - Codex 2026-10-15： Add platform lock injection, a separate ALL processing API, and C++ initialization support.
+ * - Codex 2026-10-15： Document per-hub concurrency, node ownership contention, and callback reentry.
+ * - Codex 2026-10-15： Document busy-hub skipping, partial consumption, and selected-hub exclusion.
+ * - Codex 2026-10-15： Document descriptor transactions and list traversal and callbacks outside platform exclusion.
+ * - Codex 2026-10-15： Prepare version 0.1.0 with English source documentation.
+ * - Codex 2026-10-16：Add dispatch modes, global notification, draining, and live subscriptions.
+ * - Codex 2026-10-16：Release version 0.2.0.
  */
 
 #ifndef DDHUB_H_
@@ -24,24 +27,32 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/** @brief Optional build-wide replacement for the user configuration header. */
+/** @brief Build-wide replacement for the application configuration header. */
 #ifndef DDHUB_CONFIG_HEADER
 #define DDHUB_CONFIG_HEADER                                 "ddhub_config.h"
 #endif
 #include DDHUB_CONFIG_HEADER
 
+/** @brief Enable queued dispatch; zero selects direct synchronous send. */
+#ifndef DDHUB_ASYNC_PROCESS_ENABLE
+#define DDHUB_ASYNC_PROCESS_ENABLE                          1
+#endif
+#if (DDHUB_ASYNC_PROCESS_ENABLE != 0) && (DDHUB_ASYNC_PROCESS_ENABLE != 1)
+#error "DDHUB_ASYNC_PROCESS_ENABLE must be 0 or 1"
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/** @brief Initial value for an unregistered node; static zero initialization is equivalent. */
+/** @brief Initial value for a caller-owned unregistered node. */
 #ifdef __cplusplus
 #define DDHUB_SUBSCRIPTION_INIT                             { }
 #else
 #define DDHUB_SUBSCRIPTION_INIT                             {0}
 #endif
 
-/** @brief Operation results, independent of errno and the operating system. */
+/** @brief Portable operation results; failures never accept a sent message. */
 typedef enum {
     DDHUB_OK = 0,
     DDHUB_INVALID = -1,
@@ -52,84 +63,77 @@ typedef enum {
     DDHUB_NOT_READY = -6,
 } ddhub_status_t;
 
-/** @brief Opaque per-acquisition token, such as an interrupt-state key. */
+/** @brief Per-acquisition platform token, such as saved interrupt state. */
 typedef uintptr_t                                           ddhub_lock_key_t;
 
 /**
- * @brief Enter a short exclusion region for shared state and fixed-size message descriptors.
- * @return Token for this acquisition, passed unchanged to the matching unlock callback.
+ * @brief Acquire platform exclusion and acquire memory ordering successfully.
+ * @return Token restored by the matching unlock call in the same context.
  *
- * Must acquire exclusion successfully and provide acquire/release memory ordering together
- * with unlock. It must not call ddhub. Blocking behavior and supported thread/ISR contexts
- * depend on the adapter; nonblocking use requires a nonblocking adapter.
- * Regions cover state checks and FIFO descriptor updates, never payload copying, subscription
- * traversal, or user callbacks. ALL entry/exit regions visit the configured number of hubs.
+ * Must not call ddhub. Supported thread/ISR contexts and possible blocking depend on
+ * the adapter. Regions cover descriptors, link commits, and selecting the next eligible
+ * subscription, never payload copying or user callbacks. Sorted writer scans run outside
+ * exclusion; eligibility filtering and rare registration-sequence rebasing run inside it.
  */
 typedef ddhub_lock_key_t (*ddhub_lock_t)(void);
 
 /**
- * @brief Leave the platform's exclusion region and restore its previous state.
- * @param key Token returned by the matching lock call in the same execution context.
+ * @brief Release platform exclusion with release memory ordering.
+ * @param key Token returned by this acquisition's matching lock callback.
  *
- * Must provide release ordering and must not call ddhub. No shared global token may replace
- * this per-call value, because distinct callers may use the adapter concurrently.
+ * Must not call ddhub or substitute a shared global token for the per-call key.
  */
 typedef void (*ddhub_unlock_t)(ddhub_lock_key_t key);
 
 /**
- * @brief Bind the platform lock callbacks once, before concurrent use of any ddhub API.
- * @param lock Non-NULL exclusion-entry function.
- * @param unlock Non-NULL matching exclusion-exit function.
- * @return DDHUB_OK, DDHUB_INVALID for a NULL callback, or DDHUB_BUSY if already bound.
- *
- * Call from serialized startup code before any other ddhub operation or worker starts.
- * Callbacks remain fixed for the lifetime of the component. Unbound operations return
- * DDHUB_NOT_READY. Binding does not reset objects, nodes, or queues.
+ * @brief Bind permanent platform lock callbacks before any concurrent use.
+ * @param lock Non-NULL exclusion-entry callback.
+ * @param unlock Non-NULL matching exclusion-exit callback.
+ * @return DDHUB_OK, DDHUB_INVALID for NULL callbacks, or DDHUB_BUSY if already bound.
  */
 ddhub_status_t ddhub_set_lock_ops(ddhub_lock_t lock, ddhub_unlock_t unlock);
 
 /**
- * @brief Consume the intersection of a message's events and a subscription's events.
- * @param event Nonzero event intersection; all 32 bits are available to the application.
- * @param data Original mutable payload pointer, shared by all consumers of this message.
- * @param len Payload size in bytes; zero permits a NULL data pointer.
- * @param arg1 First mutable subscriber context supplied during registration.
- * @param arg2 Second mutable subscriber context supplied during registration.
- * @param arg3 Third mutable subscriber context supplied during registration.
+ * @brief Consume one message's intersection with this subscription's event mask.
+ * @param event Nonzero matched mask; all 32 bits are application-owned.
+ * @param data Original mutable borrowed payload, shared by this message's consumers.
+ * @param len Payload size in bytes; zero allows NULL data.
+ * @param arg1 First subscriber context.
+ * @param arg2 Second subscriber context.
+ * @param arg3 Third subscriber context.
  *
- * No internal lock is held. Use const pointer parameters in the callback definition too
- * if local pointer reassignment must be rejected by the compiler. Pointees remain mutable.
- * The same function may run concurrently for different hubs; synchronize shared pointees
- * in application code. Publishing from a callback is allowed. Subscription changes to
- * the currently processing hub and processing it recursively return DDHUB_BUSY.
+ * Runs outside locks. Registration is allowed and takes effect from the next message.
+ * Unregistering the active node returns BUSY; other nodes may be removed. Synchronous
+ * callbacks inherit the sender's context and may overlap on different hubs. Asynchronous
+ * callbacks run on the unique process caller. Synchronize shared application objects.
  */
 typedef void (*ddhub_callback_t)(uint32_t event, void *const data, size_t len, void *const arg1, void *const arg2,
                                  void *const arg3);
 
 /**
- * @brief Notify the producer that one accepted message has been fully consumed.
- * @param hub_id Actual hub that consumed the message, in [0, DDHUB_ID_COUNT).
- * @param event Original published event mask, without subscription filtering.
- * @param data Original payload pointer; it may be released or reused in this callback.
- * @param len Original payload size in bytes.
- * @param arg Per-message producer context supplied as done_arg to ddhub_send().
+ * @brief Complete one accepted message after all matching callbacks return.
+ * @param hub_id Actual consuming hub ID.
+ * @param event Original unfiltered event mask.
+ * @param data Original payload; it may be released or reused here.
+ * @param len Original payload size.
+ * @param arg Per-message producer context supplied as done_arg.
  *
- * Called once per consumed message, including messages with no matching subscriptions.
- * No internal lock is held. The hub remains processing until its current batch finishes.
+ * Runs once even without matching subscriptions, outside locks. No payload/context access
+ * follows this callback. The hub keeps processing rights until this callback returns.
  */
 typedef void (*ddhub_process_done_t)(ddhub_id_t hub_id, uint32_t event, void *const data, size_t len, void *const arg);
 
 /**
- * @brief Caller-owned intrusive subscription; fields are private to ddhub after initialization.
+ * @brief Caller-owned intrusive node; all fields are private while registered or being registered.
  *
- * Keep the node and its contexts valid until successful unregistration and until every
- * concurrent operation referring to this node has returned. Coordinate reuse with other
- * callers. Do not copy, reinitialize, or modify a registered node. Concurrent registration
- * attempts cannot place one node in multiple hubs; one node belongs to at most one hub.
+ * Initialize once before use. Do not copy or modify registered nodes. Keep the node and
+ * contexts alive until successful unregistration and all other concurrent users return.
+ * One node belongs to at most one hub; successful re-registration is a new subscription.
  */
 typedef struct ddhub_subscription {
     struct ddhub_subscription *next;
     ddhub_id_t                 hub_id;
+    uint64_t                   generation;
     uint32_t                   event;
     uint8_t                    priority;
     uint8_t                    registered;
@@ -140,99 +144,90 @@ typedef struct ddhub_subscription {
 } ddhub_subscription_t;
 
 /**
- * @brief Register a node in ascending priority order, preserving registration order for ties.
- * @param hub_id Actual target hub ID, in [0, DDHUB_ID_COUNT).
- * @param subscription Initialized, unregistered caller-owned node.
- * @param event Nonzero subscription event mask.
- * @param priority Priority in the range 0..255; smaller values execute first.
- * @param callback Non-NULL consumer function.
- * @param arg1 First caller-owned context; NULL is permitted.
- * @param arg2 Second caller-owned context; NULL is permitted.
- * @param arg3 Third caller-owned context; NULL is permitted.
+ * @brief Register in ascending priority order, preserving registration order for ties.
+ * @param hub_id Actual target hub ID in [0, DDHUB_ID_COUNT).
+ * @param subscription Initialized caller-owned node.
+ * @param event Nonzero event mask.
+ * @param priority Priority 0..255; smaller values execute first.
+ * @param callback Non-NULL consumer callback.
+ * @param arg1 First optional subscriber context.
+ * @param arg2 Second optional subscriber context.
+ * @param arg3 Third optional subscriber context.
  * @return DDHUB_OK, DDHUB_INVALID, DDHUB_BUSY, DDHUB_ALREADY_REGISTERED, or DDHUB_NOT_READY.
  *
- * Different hubs with distinct nodes can register concurrently. Same-hub metadata
- * contention returns DDHUB_BUSY. Processing freezes only its selected hubs' subscriptions;
- * ddhub_process_all() skips busy hubs. Node ownership is claimed under the platform lock,
- * so competing registrations of the same node cannot both succeed while it remains registered.
+ * Allowed during dispatch. The new subscription skips a message whose dispatch has already
+ * begun and participates from the next message, including within the same process call.
+ * Same-hub list-writer contention may return BUSY; it does not block FIFO operations.
  */
 ddhub_status_t ddhub_register(ddhub_id_t hub_id, ddhub_subscription_t *subscription, uint32_t event, uint8_t priority,
                               ddhub_callback_t callback, void *arg1, void *arg2, void *arg3);
 
 /**
- * @brief Unlink a subscription and mark it unregistered so the caller may reuse it.
- * @param subscription Initialized caller-owned node.
+ * @brief Remove an inactive node; dispatch will no longer access it after success.
+ * @param subscription Initialized caller-owned subscription node.
  * @return DDHUB_OK, DDHUB_INVALID, DDHUB_BUSY, DDHUB_NOT_REGISTERED, or DDHUB_NOT_READY.
  *
- * Resolves and reserves the current owner under the platform lock. Different owners can
- * unlink distinct nodes concurrently. The node may be claimed by another caller once it
- * has been unlinked; the caller must coordinate its lifetime and subsequent reuse.
+ * BUSY protects the node still used by dispatch or a competing list writer. Successful
+ * removal before selection also cancels this node's delivery of the current message.
+ * Coordinate reuse with other concurrent callers that hold the same node pointer.
  */
 ddhub_status_t ddhub_unregister(ddhub_subscription_t *subscription);
 
 /**
- * @brief Set a hub's completion function only while its FIFO is empty and it is not processing.
- * @param hub_id Actual target hub ID, in [0, DDHUB_ID_COUNT).
- * @param done Per-hub completion function; NULL disables completion notification.
+ * @brief Configure completion only while the target hub is idle and its queue is empty.
+ * @param hub_id Actual target hub ID.
+ * @param done Completion callback; NULL disables it.
  * @return DDHUB_OK, DDHUB_INVALID, DDHUB_BUSY, or DDHUB_NOT_READY.
- *
- * Affects only the selected hub; metadata work on another hub does not cause bool-lock
- * contention here. An active ddhub_process_all() freezes only its selected hubs' functions.
  */
 ddhub_status_t ddhub_set_process_done(ddhub_id_t hub_id, ddhub_process_done_t done);
 
 /**
- * @brief Enqueue a borrowed payload without executing callbacks or allocating memory.
- * @param hub_id Actual target hub ID, in [0, DDHUB_ID_COUNT).
- * @param event Nonzero published event mask.
- * @param data Mutable payload, kept valid and not changed by the producer until completion.
- * @param len Payload size in bytes; a positive size requires non-NULL data.
- * @param done_arg Producer context retained until completion; NULL is permitted.
+ * @brief Send directly in synchronous builds or enqueue and notify in asynchronous builds.
+ * @param hub_id Actual target hub ID.
+ * @param event Nonzero application event mask.
+ * @param data Borrowed mutable payload, kept valid and unchanged by its producer until completion.
+ * @param len Payload size in bytes; positive size requires non-NULL data.
+ * @param done_arg Optional producer context, kept valid until completion.
  * @return DDHUB_OK, DDHUB_INVALID, DDHUB_BUSY, DDHUB_QUEUE_FULL, or DDHUB_NOT_READY.
  *
- * Failure leaves ownership with the producer and never invokes the completion function.
- * Queue capacity excludes the message currently executing callbacks. Lock contention
- * on the internal bool lock returns immediately; the adapter itself may wait. Shared
- * payload/context access across hubs is the caller's responsibility.
- * Each hub has its own metadata lock. The entire enqueue transaction uses one short
- * platform exclusion region. Another hub's list operation does not cause DDHUB_BUSY;
- * an unfinished list operation on this hub can. The platform adapter itself may wait.
+ * Failure does not accept the payload or invoke completion. Synchronous success completes
+ * this message before return; same-hub overlapping sends return BUSY. Synchronous callbacks
+ * inherit the sender's context. Prefer asynchronous builds for ISR sends to shorten ISR
+ * execution. Async success stores only a descriptor and invokes the global notify outside
+ * locks; the notification adapter must support the sender's thread/ISR context.
  */
 ddhub_status_t ddhub_send(ddhub_id_t hub_id, uint32_t event, void *data, size_t len, void *done_arg);
 
+#if DDHUB_ASYNC_PROCESS_ENABLE
 /**
- * @brief Process only messages pending at entry for one specified hub.
- * @param hub_id Actual hub ID, in [0, DDHUB_ID_COUNT).
- * @return DDHUB_OK, DDHUB_INVALID, DDHUB_BUSY, or DDHUB_NOT_READY; BUSY may follow partial consumption.
+ * @brief Arrange later processing after successful enqueue or a list writer releases pending work.
  *
- * Different hubs may process concurrently; the same hub cannot. This call freezes only
- * that hub's list. An ALL call skips hubs already processing; conversely, this call may
- * process a hub omitted by an active ALL call once it becomes idle. Callbacks and completion
- * notifications execute in the caller's context without internal or platform locks.
- * Reentrant calls follow the same exclusion rules. Metadata work on other hubs does not
- * interfere with this hub's FIFO snapshot or consumption.
- *
- * New messages wait for the next call. On a mid-batch lock conflict, remaining messages
- * stay queued; already completed messages are not replayed. Completion notifications,
- * not this function's status, determine when individual payloads can be reused.
+ * One global optional hook, called without locks in the sending/writing context. It must
+ * retain wakeups as needed by the application and must support the actual thread/ISR contexts.
+ * It should schedule the unique consumer rather than depend on recursive process calls.
  */
-ddhub_status_t ddhub_process(ddhub_id_t hub_id);
+typedef void (*ddhub_process_notify_t)(void);
 
 /**
- * @brief Process entry-pending messages for available hubs in enumeration order, skipping busy hubs.
- * @return DDHUB_OK, DDHUB_BUSY, or DDHUB_NOT_READY; BUSY may follow partial consumption.
+ * @brief Bind the optional notification once during serialized startup, after lock binding.
+ * @param notify Global scheduling hook; NULL permanently selects polling-only use.
+ * @return DDHUB_OK, DDHUB_BUSY if already bound, or DDHUB_NOT_READY before lock binding.
  *
- * Only one ALL call may run at a time. At entry, reserve hubs that have neither an active
- * processor nor a busy metadata lock. Freeze only those hubs' lists and completion functions
- * until this call returns, and capture all their pending counts before any callbacks start.
- * Skipped hubs remain available to other calls once their current operation finishes;
- * this ALL call never revisits them. New messages wait for the next processing call.
- * Any skipped hub or mid-batch queue contention makes the result DDHUB_BUSY, but processing
- * continues for other selected hubs. A second ALL call returns DDHUB_BUSY without consuming.
- * Callbacks and notifications run without internal or platform locks. Remaining messages
- * stay queued; completion notifications determine payload reuse, even on DDHUB_BUSY.
+ * Leaving this function uncalled also permits polling. A bound hook remains fixed.
  */
-ddhub_status_t ddhub_process_all(void);
+ddhub_status_t ddhub_set_process_notify(ddhub_process_notify_t notify);
+
+/**
+ * @brief Drain every hub by bounded rounds, including messages arriving during processing.
+ * @return DDHUB_OK, DDHUB_BUSY for overlapping/reentrant calls, or DDHUB_NOT_READY.
+ *
+ * Exactly one consumer may be active. This function does not wait for data. OK means all
+ * queues were empty at the final locked check that also releases processing rights; later
+ * sends schedule subsequent work. Continuous sends may prevent return. Callbacks and done
+ * run outside locks. No per-hub processing API or separate process_all API is provided.
+ */
+ddhub_status_t ddhub_process(void);
+#endif
 
 #ifdef __cplusplus
 }

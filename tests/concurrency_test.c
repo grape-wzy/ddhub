@@ -2,22 +2,24 @@
  * @file concurrency_test.c
  * @brief Verify concurrent ddhub publication and processing.
  * @details ddhub stands for Data Dispatch Hub, an event-driven data distribution center.
- *          Use real threads and controlled pauses to test exclusion, busy-hub skipping, snapshots, and message
- * integrity.
- * @version 0.1.0
+ *          Use real threads and controlled pauses to verify live node safety, drain handoff, and retained wakeups.
+ * @version 0.2.0
  * @date 2026-10-14 (development date)
  *
  * @par Release notes
+ * 0.2.0: Dispatch modes, global notification, draining, and live subscriptions.
  * 0.1.0: Initial version; first release.
  *
- * @par Modification history
- * - Codex 2026-10-14: Add concurrency admission and a 2000-message multi-producer test.
- * - Codex 2026-10-15: Document file responsibilities, development dates, and modification history.
- * - Codex 2026-10-15: Inject a pthread adapter to test bool lock contention and processing cleanup without atomics.
- * - Codex 2026-10-15: Test parallel registration, shared-node contention, and ownership transfer after unregistration.
- * - Codex 2026-10-15: Test busy-hub skipping, independent cleanup, and continued ALL dispatch after contention.
- * - Codex 2026-10-15: Use list reservations to test contention and concurrent enqueue against ALL snapshots.
- * - Codex 2026-10-15: Prepare version 0.1.0 with English source documentation.
+ * @par 修改记录
+ * - Codex 2026-10-14： Add concurrency admission and a 2000-message multi-producer test.
+ * - Codex 2026-10-15： Document file responsibilities, development dates, and modification history.
+ * - Codex 2026-10-15： Inject a pthread adapter to test bool lock contention and processing cleanup without atomics.
+ * - Codex 2026-10-15： Test parallel registration, shared-node contention, and ownership transfer after unregistration.
+ * - Codex 2026-10-15： Test busy-hub skipping, independent cleanup, and continued ALL dispatch after contention.
+ * - Codex 2026-10-15： Use list reservations to test contention and concurrent enqueue against ALL snapshots.
+ * - Codex 2026-10-15： Prepare version 0.1.0 with English source documentation.
+ * - Codex 2026-10-16：Test live nodes, writer interleavings, drain handoff, and binary wakeups.
+ * - Codex 2026-10-16：Release version 0.2.0.
  */
 
 #include "ddhub.h"
@@ -31,72 +33,42 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 
-struct callback_gate {
+struct gate {
     pthread_mutex_t mutex;
     pthread_cond_t  condition;
     bool            entered;
     bool            released;
     unsigned int    calls;
 };
-
-struct process_request {
-    ddhub_id_t     hub_id;
-    ddhub_status_t status;
-    bool           all;
-};
-
-static struct callback_gate gate_a = {
-    .mutex = PTHREAD_MUTEX_INITIALIZER,
-    .condition = PTHREAD_COND_INITIALIZER,
-};
-static struct callback_gate gate_b = {
-    .mutex = PTHREAD_MUTEX_INITIALIZER,
-    .condition = PTHREAD_COND_INITIALIZER,
+static struct gate gate = {
+    PTHREAD_MUTEX_INITIALIZER,
+    PTHREAD_COND_INITIALIZER,
+    false,
+    false,
+    0U
 };
 static ddhub_subscription_t nodes[5];
-static unsigned int         hub_c_calls;
-static unsigned int         done_calls[DDHUB_ID_COUNT];
+static unsigned int         captures;
+
+struct request {
+    ddhub_subscription_t *node;
+    ddhub_id_t            hub;
+    ddhub_status_t        status;
+    bool                  pause;
+};
 
 /**
- * @brief Block inside a user callback so another thread can inspect processing exclusion.
- * @param event Matched event mask.
- * @param data Optional payload.
- * @param len Payload size.
- * @param arg1 Callback gate.
- * @param arg2 Unused context.
- * @param arg3 Unused context.
+ * @brief Record callback identity, matched mask, payload value, and mutable contexts.
+ * @param event Matched application event mask.
+ * @param data Borrowed message payload.
+ * @param len Payload size in bytes.
+ * @param arg1 First subscriber test context.
+ * @param arg2 Second subscriber test context.
+ * @param arg3 Third subscriber test context.
  */
-static void blocking_callback(uint32_t event, void *const data, size_t len, void *const arg1, void *const arg2,
-                              void *const arg3)
-{
-    ddhub_test_assert_unlocked();
-    (void)event;
-    (void)data;
-    (void)len;
-    (void)arg2;
-    (void)arg3;
-    struct callback_gate *gate = arg1;
-    assert(pthread_mutex_lock(&gate->mutex) == 0);
-    ++gate->calls;
-    gate->entered = true;
-    assert(pthread_cond_broadcast(&gate->condition) == 0);
-    while (!gate->released) {
-        assert(pthread_cond_wait(&gate->condition, &gate->mutex) == 0);
-    }
-    assert(pthread_mutex_unlock(&gate->mutex) == 0);
-}
-
-/**
- * @brief Count third-hub processing on the coordinating thread.
- * @param event Matched mask.
- * @param data Optional payload.
- * @param len Payload size.
- * @param arg1 Unused context.
- * @param arg2 Unused context.
- * @param arg3 Unused context.
- */
-static void count_c(uint32_t event, void *const data, size_t len, void *const arg1, void *const arg2, void *const arg3)
+static void capture(uint32_t event, void *const data, size_t len, void *const arg1, void *const arg2, void *const arg3)
 {
     ddhub_test_assert_unlocked();
     (void)event;
@@ -105,268 +77,122 @@ static void count_c(uint32_t event, void *const data, size_t len, void *const ar
     (void)arg1;
     (void)arg2;
     (void)arg3;
-    ++hub_c_calls;
+    ++captures;
 }
 
 /**
- * @brief Count completions independently for each hub during controlled processing.
- * @param hub_id Consuming hub, whose processing right serializes its own counter.
- * @param event Original event mask.
- * @param data Optional payload.
- * @param len Payload size.
- * @param arg Unused producer context.
+ * @brief Hold the active callback until the coordinating thread releases it.
+ * @param event Matched application event mask.
+ * @param data Borrowed message payload.
+ * @param len Payload size in bytes.
+ * @param arg1 First subscriber test context.
+ * @param arg2 Second subscriber test context.
+ * @param arg3 Third subscriber test context.
  */
-static void count_done(ddhub_id_t hub_id, uint32_t event, void *const data, size_t len, void *const arg)
+static void block(uint32_t event, void *const data, size_t len, void *const arg1, void *const arg2, void *const arg3)
 {
     ddhub_test_assert_unlocked();
     (void)event;
     (void)data;
     (void)len;
-    (void)arg;
-    ++done_calls[hub_id];
+    (void)arg1;
+    (void)arg2;
+    (void)arg3;
+    assert(pthread_mutex_lock(&gate.mutex) == 0);
+    ++gate.calls;
+    gate.entered = true;
+    assert(pthread_cond_broadcast(&gate.condition) == 0);
+    while (!gate.released) {
+        assert(pthread_cond_wait(&gate.condition, &gate.mutex) == 0);
+    }
+    assert(pthread_mutex_unlock(&gate.mutex) == 0);
 }
 
 /**
- * @brief Execute one processing request in a real host thread.
- * @param arg Request storage, retained until thread join.
- * @return NULL after saving the processing result.
+ * @brief Wait until the consumer has pinned its blocking subscription.
+ */
+static void await_gate(void)
+{
+    assert(pthread_mutex_lock(&gate.mutex) == 0);
+    while (!gate.entered) {
+        assert(pthread_cond_wait(&gate.condition, &gate.mutex) == 0);
+    }
+    assert(pthread_mutex_unlock(&gate.mutex) == 0);
+}
+
+/**
+ * @brief Allow the pinned callback to return.
+ */
+static void release_gate(void)
+{
+    assert(pthread_mutex_lock(&gate.mutex) == 0);
+    gate.released = true;
+    assert(pthread_cond_broadcast(&gate.condition) == 0);
+    assert(pthread_mutex_unlock(&gate.mutex) == 0);
+}
+
+/**
+ * @brief Reset a gate after all previous users have joined.
+ */
+static void reset_gate(void)
+{
+    gate.entered = false;
+    gate.released = false;
+    gate.calls = 0U;
+}
+
+/**
+ * @brief Dispatch one request from a separate consumer thread.
+ * @param arg Caller-owned context retained until completion.
+ * @return NULL after the worker completes.
  */
 static void *process_thread(void *arg)
 {
-    struct process_request *request = arg;
-    request->status = request->all ? ddhub_process_all() : ddhub_process(request->hub_id);
+    struct request *request = arg;
+    if (request->pause) {
+        ddhub_test_pause_next_unlock();
+    }
+#if DDHUB_ASYNC_PROCESS_ENABLE
+    request->status = ddhub_process();
+#else
+    request->status = ddhub_send(TEST_HUB_A,
+                                 1U,
+                                 NULL,
+                                 0U,
+                                 NULL);
+#endif
     return NULL;
 }
 
 /**
- * @brief Wait until a consumer has entered its blocking callback.
- * @param gate Gate used by the consumer.
+ * @brief Attempt removal after an optional controlled writer pause.
+ * @param arg Caller-owned context retained until completion.
+ * @return NULL after the worker completes.
  */
-static void await_gate(struct callback_gate *gate)
+static void *unregister_thread(void *arg)
 {
-    assert(pthread_mutex_lock(&gate->mutex) == 0);
-    while (!gate->entered) {
-        assert(pthread_cond_wait(&gate->condition, &gate->mutex) == 0);
+    struct request *request = arg;
+    if (request->pause) {
+        ddhub_test_pause_next_unlock();
     }
-    assert(pthread_mutex_unlock(&gate->mutex) == 0);
+    request->status = ddhub_unregister(request->node);
+    return NULL;
 }
 
 /**
- * @brief Permit a blocked callback to finish.
- * @param gate Gate used by the consumer.
+ * @brief Pause after claiming ownership and then publish a new subscription.
+ * @param arg Caller-owned context retained until completion.
+ * @return NULL after the worker completes.
  */
-static void release_gate(struct callback_gate *gate)
+static void *register_thread(void *arg)
 {
-    assert(pthread_mutex_lock(&gate->mutex) == 0);
-    gate->released = true;
-    assert(pthread_cond_broadcast(&gate->condition) == 0);
-    assert(pthread_mutex_unlock(&gate->mutex) == 0);
-}
-
-/**
- * @brief Reset a gate after its previous processing thread has been joined.
- * @param gate Inactive gate.
- */
-static void reset_gate(struct callback_gate *gate)
-{
-    gate->entered = false;
-    gate->released = false;
-    gate->calls = 0U;
-}
-
-/** @brief Prove parallel single-hub processing and ALL consumption of the remaining idle hub. */
-static void test_parallel_hubs(void)
-{
-    hub_c_calls = 0U;
-    static struct process_request request_a = {.hub_id = TEST_HUB_A};
-    static struct process_request request_b = {.hub_id = TEST_HUB_B};
-    pthread_t                     thread_a;
-    pthread_t                     thread_b;
-    assert(ddhub_register(TEST_HUB_A,
-                          &nodes[0],
-                          1U,
-                          0U,
-                          blocking_callback,
-                          &gate_a,
-                          NULL,
-                          NULL) == DDHUB_OK);
-    assert(ddhub_register(TEST_HUB_B,
-                          &nodes[1],
-                          1U,
-                          0U,
-                          blocking_callback,
-                          &gate_b,
-                          NULL,
-                          NULL) == DDHUB_OK);
-    assert(ddhub_register(TEST_HUB_C,
-                          &nodes[2],
-                          1U,
-                          0U,
-                          count_c,
-                          NULL,
-                          NULL,
-                          NULL) == DDHUB_OK);
-    assert(ddhub_send(TEST_HUB_A,
-                      1U,
-                      NULL,
-                      0U,
-                      NULL) == DDHUB_OK);
-    assert(ddhub_send(TEST_HUB_B,
-                      1U,
-                      NULL,
-                      0U,
-                      NULL) == DDHUB_OK);
-    assert(pthread_create(&thread_a,
-                          NULL,
-                          process_thread,
-                          &request_a) == 0);
-    await_gate(&gate_a);
-    assert(ddhub_process(TEST_HUB_A) == DDHUB_BUSY);
-    assert(ddhub_unregister(&nodes[0]) == DDHUB_BUSY);
-    assert(ddhub_register(TEST_HUB_A,
-                          &nodes[3],
-                          1U,
-                          0U,
-                          count_c,
-                          NULL,
-                          NULL,
-                          NULL) == DDHUB_BUSY);
-    assert(ddhub_set_process_done(TEST_HUB_A, NULL) == DDHUB_BUSY);
-    assert(ddhub_send(TEST_HUB_A,
-                      1U,
-                      NULL,
-                      0U,
-                      NULL) == DDHUB_OK);
-
-    assert(pthread_create(&thread_b,
-                          NULL,
-                          process_thread,
-                          &request_b) == 0);
-    await_gate(&gate_b);
-    assert(ddhub_process(TEST_HUB_B) == DDHUB_BUSY);
-    /* Another idle hub's registry and queue remain usable while A and B are blocked. */
-    assert(ddhub_register(TEST_HUB_C,
-                          &nodes[3],
-                          1U,
-                          1U,
-                          count_c,
-                          NULL,
-                          NULL,
-                          NULL) == DDHUB_OK);
-    assert(ddhub_unregister(&nodes[3]) == DDHUB_OK);
-    assert(ddhub_send(TEST_HUB_C,
-                      1U,
-                      NULL,
-                      0U,
-                      NULL) == DDHUB_OK);
-    assert(ddhub_process_all() == DDHUB_BUSY);
-    assert(hub_c_calls == 1U);
-
-    release_gate(&gate_b);
-    assert(pthread_join(thread_b, NULL) == 0);
-    release_gate(&gate_a);
-    assert(pthread_join(thread_a, NULL) == 0);
-    assert((request_a.status == DDHUB_OK) && (request_b.status == DDHUB_OK));
-    assert((gate_a.calls == 1U) && (gate_b.calls == 1U));
-    assert(ddhub_process(TEST_HUB_A) == DDHUB_OK);
-    assert(gate_a.calls == 2U);
-    for (size_t i = 0U; i < 3U; ++i) {
-        assert(ddhub_unregister(&nodes[i]) == DDHUB_OK);
-    }
-}
-
-/** @brief Prove ALL excludes processors of its selected hubs and snapshots before callbacks start. */
-static void test_all_exclusion(void)
-{
-    static struct process_request request_all = {.all = true};
-    pthread_t                     thread_all;
-    reset_gate(&gate_a);
-    reset_gate(&gate_b);
-    hub_c_calls = 0U;
-    assert(ddhub_register(TEST_HUB_A,
-                          &nodes[0],
-                          1U,
-                          0U,
-                          blocking_callback,
-                          &gate_a,
-                          NULL,
-                          NULL) == DDHUB_OK);
-    assert(ddhub_register(TEST_HUB_B,
-                          &nodes[1],
-                          1U,
-                          0U,
-                          blocking_callback,
-                          &gate_b,
-                          NULL,
-                          NULL) == DDHUB_OK);
-    assert(ddhub_register(TEST_HUB_C,
-                          &nodes[2],
-                          1U,
-                          0U,
-                          count_c,
-                          NULL,
-                          NULL,
-                          NULL) == DDHUB_OK);
-    assert(ddhub_send(TEST_HUB_A,
-                      1U,
-                      NULL,
-                      0U,
-                      NULL) == DDHUB_OK);
-    assert(ddhub_send(TEST_HUB_B,
-                      1U,
-                      NULL,
-                      0U,
-                      NULL) == DDHUB_OK);
-    assert(pthread_create(&thread_all,
-                          NULL,
-                          process_thread,
-                          &request_all) == 0);
-    await_gate(&gate_a);
-    assert(ddhub_process(TEST_HUB_A) == DDHUB_BUSY);
-    assert(ddhub_process(TEST_HUB_B) == DDHUB_BUSY);
-    assert(ddhub_process(TEST_HUB_C) == DDHUB_BUSY);
-    assert(ddhub_process_all() == DDHUB_BUSY);
-    assert(ddhub_unregister(&nodes[1]) == DDHUB_BUSY);
-    assert(ddhub_set_process_done(TEST_HUB_C, NULL) == DDHUB_BUSY);
-    assert(ddhub_send(TEST_HUB_C,
-                      1U,
-                      NULL,
-                      0U,
-                      NULL) == DDHUB_OK);
-    release_gate(&gate_a);
-    await_gate(&gate_b);
-    assert(ddhub_process(TEST_HUB_A) == DDHUB_BUSY);
-    release_gate(&gate_b);
-    assert(pthread_join(thread_all, NULL) == 0);
-    assert(request_all.status == DDHUB_OK);
-    assert(hub_c_calls == 0U);
-    assert(ddhub_process(TEST_HUB_C) == DDHUB_OK);
-    assert(hub_c_calls == 1U);
-    for (size_t i = 0U; i < 3U; ++i) {
-        assert(ddhub_unregister(&nodes[i]) == DDHUB_OK);
-    }
-}
-
-struct registration_request {
-    ddhub_id_t            hub_id;
-    ddhub_subscription_t *node;
-    ddhub_status_t        status;
-};
-
-/**
- * @brief Hold a hub's metadata lock after claiming a node, before traversing its list.
- * @param arg Registration request retained until thread join.
- * @return NULL after registration finishes.
- */
-static void *paused_register_thread(void *arg)
-{
-    struct registration_request *request = arg;
+    struct request *request = arg;
     ddhub_test_pause_next_unlock();
-    request->status = ddhub_register(request->hub_id,
+    request->status = ddhub_register(request->hub,
                                      request->node,
                                      1U,
-                                     0U,
-                                     count_c,
+                                     10U,
+                                     capture,
                                      NULL,
                                      NULL,
                                      NULL);
@@ -374,566 +200,424 @@ static void *paused_register_thread(void *arg)
 }
 
 /**
- * @brief Pause after the complete enqueue transaction has released both locks.
- * @param arg Storage for the send result, retained until thread join.
- * @return NULL after the controlled send finishes.
+ * @brief Queue the first asynchronous message before starting the consumer.
  */
-static void *paused_send_thread(void *arg)
+static void send_initial(void)
 {
-    ddhub_test_pause_next_unlock();
-    *(ddhub_status_t *)arg = ddhub_send(TEST_HUB_A,
-                                        1U,
-                                        NULL,
-                                        0U,
-                                        NULL);
-    return NULL;
-}
-
-/** @brief Verify same-hub contention while unrelated hub operations continue successfully. */
-static void test_bool_lock_contention(void)
-{
-    pthread_t                   worker;
-    struct registration_request request = {.hub_id = TEST_HUB_A, .node = &nodes[3]};
-    hub_c_calls = 0U;
-    assert(ddhub_register(TEST_HUB_C,
-                          &nodes[4],
-                          1U,
-                          0U,
-                          count_c,
-                          NULL,
-                          NULL,
-                          NULL) == DDHUB_OK);
-    assert(ddhub_send(TEST_HUB_C,
+#if DDHUB_ASYNC_PROCESS_ENABLE
+    assert(ddhub_send(TEST_HUB_A,
                       1U,
                       NULL,
                       0U,
                       NULL) == DDHUB_OK);
-    assert(pthread_create(&worker,
+#endif
+}
+
+/**
+ * @brief Test live nodes.
+ */
+static void test_live_nodes(void)
+{
+    reset_gate();
+    captures = 0U;
+    ddhub_subscription_t *tail = calloc(1U, sizeof(*tail));
+    assert(tail != NULL);
+    assert(ddhub_register(TEST_HUB_A,
+                          &nodes[0],
+                          1U,
+                          0U,
+                          block,
                           NULL,
-                          paused_register_thread,
-                          &request) == 0);
-    ddhub_test_wait_paused();
+                          NULL,
+                          NULL) == DDHUB_OK);
+    assert(ddhub_register(TEST_HUB_A,
+                          tail,
+                          1U,
+                          20U,
+                          capture,
+                          NULL,
+                          NULL,
+                          NULL) == DDHUB_OK);
+    send_initial();
+    struct request process = {0};
+    pthread_t      thread;
+    assert(pthread_create(&thread,
+                          NULL,
+                          process_thread,
+                          &process) == 0);
+    await_gate();
+    assert(ddhub_unregister(&nodes[0]) == DDHUB_BUSY);
+    assert(ddhub_unregister(tail) == DDHUB_OK);
+    free(tail);
+    assert(ddhub_register(TEST_HUB_A,
+                          &nodes[1],
+                          1U,
+                          10U,
+                          capture,
+                          NULL,
+                          NULL,
+                          NULL) == DDHUB_OK);
+#if DDHUB_ASYNC_PROCESS_ENABLE
+    assert(ddhub_process() == DDHUB_BUSY);
+    assert(ddhub_send(TEST_HUB_A,
+                      1U,
+                      NULL,
+                      0U,
+                      NULL) == DDHUB_OK);
+#else
     assert(ddhub_send(TEST_HUB_A,
                       1U,
                       NULL,
                       0U,
                       NULL) == DDHUB_BUSY);
-    assert(ddhub_process(TEST_HUB_A) == DDHUB_BUSY);
-    assert(ddhub_process_all() == DDHUB_BUSY);
-    assert(hub_c_calls == 1U);
-    assert(ddhub_set_process_done(TEST_HUB_B, NULL) == DDHUB_OK);
-    assert(ddhub_send(TEST_HUB_B,
+#endif
+    assert(ddhub_set_process_done(TEST_HUB_A, NULL) == DDHUB_BUSY);
+    release_gate();
+    assert(pthread_join(thread, NULL) == 0);
+    assert(process.status == DDHUB_OK);
+#if !DDHUB_ASYNC_PROCESS_ENABLE
+    assert(captures == 0U);
+    assert(ddhub_send(TEST_HUB_A,
                       1U,
                       NULL,
                       0U,
                       NULL) == DDHUB_OK);
-    assert(ddhub_process(TEST_HUB_B) == DDHUB_OK);
-    assert(ddhub_unregister(&nodes[4]) == DDHUB_OK);
-    ddhub_test_resume();
-    assert(pthread_join(worker, NULL) == 0);
-    assert(request.status == DDHUB_OK);
-    assert(ddhub_unregister(&nodes[3]) == DDHUB_OK);
-    assert(ddhub_process_all() == DDHUB_OK);
+#endif
+    assert((captures == 1U) && (gate.calls == 2U));
+    assert(ddhub_unregister(&nodes[0]) == DDHUB_OK);
+    assert(ddhub_unregister(&nodes[1]) == DDHUB_OK);
 }
 
-/** @brief Keep skipped A independent while ALL owns B/C, including a new A processor. */
-static void test_all_skips_processing_hub(void)
+/**
+ * @brief Test unregister commit recheck.
+ */
+static void test_unregister_commit_recheck(void)
 {
-    static struct process_request request_a = {.hub_id = TEST_HUB_A};
-    static struct process_request request_all = {.all = true};
-    pthread_t                     thread_a;
-    pthread_t                     thread_all;
-    reset_gate(&gate_a);
-    reset_gate(&gate_b);
-    hub_c_calls = 0U;
-    for (size_t i = 0U; i < DDHUB_ID_COUNT; ++i) {
-        done_calls[i] = 0U;
-        assert(ddhub_set_process_done((ddhub_id_t)i, count_done) == DDHUB_OK);
-    }
+    reset_gate();
     assert(ddhub_register(TEST_HUB_A,
                           &nodes[0],
                           1U,
                           0U,
-                          blocking_callback,
-                          &gate_a,
-                          NULL,
-                          NULL) == DDHUB_OK);
-    assert(ddhub_register(TEST_HUB_B,
-                          &nodes[1],
-                          1U,
-                          0U,
-                          blocking_callback,
-                          &gate_b,
-                          NULL,
-                          NULL) == DDHUB_OK);
-    assert(ddhub_register(TEST_HUB_C,
-                          &nodes[2],
-                          1U,
-                          0U,
-                          count_c,
+                          block,
                           NULL,
                           NULL,
                           NULL) == DDHUB_OK);
-    assert(ddhub_send(TEST_HUB_A,
-                      1U,
-                      NULL,
-                      0U,
-                      NULL) == DDHUB_OK);
-    assert(pthread_create(&thread_a,
+    send_initial();
+    struct request removal = {
+        &nodes[0],
+        TEST_HUB_A,
+        DDHUB_INVALID,
+        true
+    };
+    pthread_t remover;
+    assert(pthread_create(&remover,
+                          NULL,
+                          unregister_thread,
+                          &removal) == 0);
+    ddhub_test_wait_paused();
+    struct request process = {0};
+    pthread_t      consumer;
+    assert(pthread_create(&consumer,
                           NULL,
                           process_thread,
-                          &request_a) == 0);
-    await_gate(&gate_a);
-    /* This A message is outside the original single-hub batch, and ALL must skip it too. */
-    assert(ddhub_send(TEST_HUB_A,
-                      1U,
-                      NULL,
-                      0U,
-                      NULL) == DDHUB_OK);
-    assert(ddhub_send(TEST_HUB_B,
-                      1U,
-                      NULL,
-                      0U,
-                      NULL) == DDHUB_OK);
-    assert(ddhub_send(TEST_HUB_C,
-                      1U,
-                      NULL,
-                      0U,
-                      NULL) == DDHUB_OK);
-    assert(pthread_create(&thread_all,
-                          NULL,
-                          process_thread,
-                          &request_all) == 0);
-    await_gate(&gate_b);
-    assert(ddhub_process_all() == DDHUB_BUSY);
-    assert(ddhub_process(TEST_HUB_B) == DDHUB_BUSY);
-    assert(ddhub_process(TEST_HUB_C) == DDHUB_BUSY);
-    assert(ddhub_unregister(&nodes[2]) == DDHUB_BUSY);
-    assert(ddhub_send(TEST_HUB_C,
-                      1U,
-                      NULL,
-                      0U,
-                      NULL) == DDHUB_OK);
-
-    release_gate(&gate_a);
-    assert(pthread_join(thread_a, NULL) == 0);
-    assert((request_a.status == DDHUB_OK) && (gate_a.calls == 1U) && (done_calls[TEST_HUB_A] == 1U));
-    /* ALL did not reserve A, so A's registry and a new processing call remain independent. */
-    assert(ddhub_register(TEST_HUB_A,
-                          &nodes[3],
-                          1U,
-                          1U,
-                          count_c,
-                          NULL,
-                          NULL,
-                          NULL) == DDHUB_OK);
-    assert(ddhub_unregister(&nodes[3]) == DDHUB_OK);
-    reset_gate(&gate_a);
-    assert(pthread_create(&thread_a,
-                          NULL,
-                          process_thread,
-                          &request_a) == 0);
-    await_gate(&gate_a);
-    release_gate(&gate_b);
-    assert(pthread_join(thread_all, NULL) == 0);
-    assert(request_all.status == DDHUB_BUSY);
-    assert((hub_c_calls == 1U) && (done_calls[TEST_HUB_B] == 1U) && (done_calls[TEST_HUB_C] == 1U));
-    /* ALL cleanup must not clear the processing right held by A's replacement call. */
-    assert(ddhub_process(TEST_HUB_A) == DDHUB_BUSY);
-    assert(ddhub_unregister(&nodes[0]) == DDHUB_BUSY);
-    assert(ddhub_process_all() == DDHUB_BUSY);
-    assert((hub_c_calls == 2U) && (done_calls[TEST_HUB_C] == 2U));
-    release_gate(&gate_a);
-    assert(pthread_join(thread_a, NULL) == 0);
-    assert((request_a.status == DDHUB_OK) && (gate_a.calls == 1U) && (done_calls[TEST_HUB_A] == 2U));
-    assert(ddhub_process_all() == DDHUB_OK);
-    for (size_t i = 0U; i < DDHUB_ID_COUNT; ++i) {
-        assert(ddhub_unregister(&nodes[i]) == DDHUB_OK);
-        assert(ddhub_set_process_done((ddhub_id_t)i, NULL) == DDHUB_OK);
-    }
+                          &process) == 0);
+    await_gate();
+    ddhub_test_resume();
+    assert(pthread_join(remover, NULL) == 0);
+    assert(removal.status == DDHUB_BUSY);
+    release_gate();
+    assert(pthread_join(consumer, NULL) == 0);
+    assert(process.status == DDHUB_OK);
+    assert(ddhub_unregister(&nodes[0]) == DDHUB_OK);
 }
 
-/** @brief Finish A/B/C while a concurrent enqueue returns, deferring the new message to the next batch. */
-static void test_all_snapshot_during_send(void)
+/**
+ * @brief Test writer does not block dispatch.
+ */
+static void test_writer_does_not_block_dispatch(void)
 {
-    static struct process_request request_all = {.all = true};
-    pthread_t                     thread_all;
-    pthread_t                     sender;
-    ddhub_status_t                send_status = DDHUB_INVALID;
-    reset_gate(&gate_a);
-    hub_c_calls = 0U;
-    for (size_t i = 0U; i < DDHUB_ID_COUNT; ++i) {
-        done_calls[i] = 0U;
-        assert(ddhub_set_process_done((ddhub_id_t)i, count_done) == DDHUB_OK);
-    }
+    captures = 0U;
     assert(ddhub_register(TEST_HUB_A,
                           &nodes[0],
                           1U,
                           0U,
-                          blocking_callback,
-                          &gate_a,
+                          capture,
+                          NULL,
                           NULL,
                           NULL) == DDHUB_OK);
+    struct request registration = {
+        &nodes[1],
+        TEST_HUB_A,
+        DDHUB_INVALID,
+        false
+    };
+    pthread_t writer;
+    assert(pthread_create(&writer,
+                          NULL,
+                          register_thread,
+                          &registration) == 0);
+    ddhub_test_wait_paused();
     assert(ddhub_register(TEST_HUB_B,
                           &nodes[1],
                           1U,
                           0U,
-                          count_c,
+                          capture,
                           NULL,
                           NULL,
-                          NULL) == DDHUB_OK);
-    assert(ddhub_register(TEST_HUB_C,
+                          NULL) == DDHUB_ALREADY_REGISTERED);
+    assert(ddhub_register(TEST_HUB_A,
                           &nodes[2],
                           1U,
                           0U,
-                          count_c,
-                          NULL,
-                          NULL,
-                          NULL) == DDHUB_OK);
-    assert(ddhub_send(TEST_HUB_A,
-                      1U,
-                      NULL,
-                      0U,
-                      NULL) == DDHUB_OK);
-    assert(ddhub_send(TEST_HUB_A,
-                      1U,
-                      NULL,
-                      0U,
-                      NULL) == DDHUB_OK);
-    assert(ddhub_send(TEST_HUB_B,
-                      1U,
-                      NULL,
-                      0U,
-                      NULL) == DDHUB_OK);
-    assert(ddhub_send(TEST_HUB_C,
-                      1U,
-                      NULL,
-                      0U,
-                      NULL) == DDHUB_OK);
-    assert(pthread_create(&thread_all,
-                          NULL,
-                          process_thread,
-                          &request_all) == 0);
-    await_gate(&gate_a);
-    assert(pthread_create(&sender,
-                          NULL,
-                          paused_send_thread,
-                          &send_status) == 0);
-    ddhub_test_wait_paused();
-    release_gate(&gate_a);
-    assert(pthread_join(thread_all, NULL) == 0);
-    assert(request_all.status == DDHUB_OK);
-    assert((gate_a.calls == 2U) && (hub_c_calls == 2U));
-    assert((done_calls[TEST_HUB_A] == 2U) && (done_calls[TEST_HUB_B] == 1U) && (done_calls[TEST_HUB_C] == 1U));
-    ddhub_test_resume();
-    assert(pthread_join(sender, NULL) == 0);
-    assert(send_status == DDHUB_OK);
-    assert(ddhub_process_all() == DDHUB_OK);
-    assert((gate_a.calls == 3U) && (done_calls[TEST_HUB_A] == 3U) && (hub_c_calls == 2U));
-    for (size_t i = 0U; i < DDHUB_ID_COUNT; ++i) {
-        assert(ddhub_unregister(&nodes[i]) == DDHUB_OK);
-        assert(ddhub_set_process_done((ddhub_id_t)i, NULL) == DDHUB_OK);
-    }
-}
-
-/** @brief Verify two threads can register distinct nodes on different hubs. */
-static void test_parallel_registration(void)
-{
-    struct registration_request request = {.hub_id = TEST_HUB_A, .node = &nodes[3]};
-    pthread_t                   worker;
-    assert(pthread_create(&worker,
-                          NULL,
-                          paused_register_thread,
-                          &request) == 0);
-    ddhub_test_wait_paused();
-    assert(ddhub_register(TEST_HUB_B,
-                          &nodes[4],
-                          1U,
-                          0U,
-                          count_c,
-                          NULL,
-                          NULL,
-                          NULL) == DDHUB_OK);
-    assert(ddhub_unregister(&nodes[4]) == DDHUB_OK);
-    assert(ddhub_register(TEST_HUB_A,
-                          &nodes[4],
-                          1U,
-                          0U,
-                          count_c,
+                          capture,
                           NULL,
                           NULL,
                           NULL) == DDHUB_BUSY);
-    ddhub_test_resume();
-    assert(pthread_join(worker, NULL) == 0);
-    assert(request.status == DDHUB_OK);
-    assert(ddhub_unregister(&nodes[3]) == DDHUB_OK);
-}
-
-/** @brief Verify competing cross-hub registrations cannot duplicate one intrusive node. */
-static void test_shared_node_registration(void)
-{
-    struct registration_request request = {.hub_id = TEST_HUB_A, .node = &nodes[3]};
-    pthread_t                   worker;
-    hub_c_calls = 0U;
-    assert(pthread_create(&worker,
-                          NULL,
-                          paused_register_thread,
-                          &request) == 0);
-    ddhub_test_wait_paused();
-    assert(ddhub_register(TEST_HUB_B,
-                          &nodes[3],
-                          1U,
-                          0U,
-                          count_c,
-                          NULL,
-                          NULL,
-                          NULL) == DDHUB_ALREADY_REGISTERED);
-    ddhub_test_resume();
-    assert(pthread_join(worker, NULL) == 0);
-    assert(request.status == DDHUB_OK);
     assert(ddhub_send(TEST_HUB_A,
                       1U,
                       NULL,
                       0U,
                       NULL) == DDHUB_OK);
-    assert(ddhub_send(TEST_HUB_B,
-                      1U,
-                      NULL,
-                      0U,
-                      NULL) == DDHUB_OK);
-    assert(ddhub_process(TEST_HUB_A) == DDHUB_OK);
-    assert(hub_c_calls == 1U);
-    assert(ddhub_process(TEST_HUB_B) == DDHUB_OK);
-    assert(hub_c_calls == 1U);
-    assert(ddhub_unregister(&nodes[3]) == DDHUB_OK);
-}
-
-/**
- * @brief Pause after publishing node availability and releasing its old hub, before returning.
- * @param arg Storage for the unregister result, retained until thread join.
- * @return NULL after unregistration finishes.
- */
-static void *paused_unregister_thread(void *arg)
-{
-    ddhub_test_pause_after_unlocks(2U);
-    *(ddhub_status_t *)arg = ddhub_unregister(&nodes[3]);
-    return NULL;
-}
-
-/** @brief Verify a node can move to a new hub while its old unregister call finishes. */
-static void test_node_owner_transfer(void)
-{
-    pthread_t      worker;
-    ddhub_status_t result = DDHUB_INVALID;
-    hub_c_calls = 0U;
-    assert(ddhub_register(TEST_HUB_A,
-                          &nodes[3],
-                          1U,
-                          0U,
-                          count_c,
-                          NULL,
-                          NULL,
-                          NULL) == DDHUB_OK);
-    assert(pthread_create(&worker,
-                          NULL,
-                          paused_unregister_thread,
-                          &result) == 0);
-    ddhub_test_wait_paused();
-    assert(ddhub_register(TEST_HUB_B,
-                          &nodes[3],
-                          1U,
-                          0U,
-                          count_c,
-                          NULL,
-                          NULL,
-                          NULL) == DDHUB_OK);
-    assert(ddhub_send(TEST_HUB_B,
-                      1U,
-                      NULL,
-                      0U,
-                      NULL) == DDHUB_OK);
-    assert(ddhub_process(TEST_HUB_B) == DDHUB_OK);
-    assert(hub_c_calls == 1U);
+#if DDHUB_ASYNC_PROCESS_ENABLE
+    assert(ddhub_process() == DDHUB_OK);
+#endif
+    assert(captures == 1U);
     ddhub_test_resume();
-    assert(pthread_join(worker, NULL) == 0);
-    assert(result == DDHUB_OK);
-    assert(ddhub_register(TEST_HUB_A,
-                          &nodes[4],
-                          1U,
-                          0U,
-                          count_c,
-                          NULL,
-                          NULL,
-                          NULL) == DDHUB_OK);
-    assert(ddhub_unregister(&nodes[4]) == DDHUB_OK);
-    assert(ddhub_register(TEST_HUB_C,
-                          &nodes[3],
-                          1U,
-                          0U,
-                          count_c,
-                          NULL,
-                          NULL,
-                          NULL) == DDHUB_ALREADY_REGISTERED);
-    assert(ddhub_unregister(&nodes[3]) == DDHUB_OK);
+    assert(pthread_join(writer, NULL) == 0);
+    assert(registration.status == DDHUB_OK);
+    assert(ddhub_send(TEST_HUB_A,
+                      1U,
+                      NULL,
+                      0U,
+                      NULL) == DDHUB_OK);
+#if DDHUB_ASYNC_PROCESS_ENABLE
+    assert(ddhub_process() == DDHUB_OK);
+#endif
+    assert(captures == 3U);
+    assert(ddhub_unregister(&nodes[0]) == DDHUB_OK);
+    assert(ddhub_unregister(&nodes[1]) == DDHUB_OK);
 }
 
-enum {
-    PRODUCER_COUNT = 4,
-    MESSAGES_PER_PRODUCER = 500,
+#if DDHUB_ASYNC_PROCESS_ENABLE
+#define PRODUCERS                                           4U
+#define PER_PRODUCER                                        500U
+struct message {
+    size_t producer;
+    size_t sequence;
+    size_t checksum;
 };
-
-struct stress_message {
-    unsigned int producer;
-    unsigned int sequence;
-    unsigned int visits;
-    bool         completed;
-};
-
-static struct stress_message messages[PRODUCER_COUNT][MESSAGES_PER_PRODUCER];
-static unsigned int          expected_sequence[PRODUCER_COUNT];
-static unsigned int          producer_ids[PRODUCER_COUNT];
-static unsigned int          completed_count;
+static struct message  messages[PRODUCERS][PER_PRODUCER];
+static size_t          received[PRODUCERS];
+static size_t          completed;
+static unsigned int    seen[PRODUCERS][PER_PRODUCER];
+static pthread_mutex_t wake_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  wake_condition = PTHREAD_COND_INITIALIZER;
+static bool            notified;
 
 /**
- * @brief Validate and mutate a message in priority order during concurrent production.
- * @param event Matched mask.
- * @param data Stress message.
- * @param len Stress message size.
- * @param arg1 Expected preceding callback count.
- * @param arg2 Unused context.
- * @param arg3 Unused context.
+ * @brief Retain one pending wakeup outside platform exclusion.
  */
-static void stress_consume(uint32_t event, void *const data, size_t len, void *const arg1, void *const arg2,
-                           void *const arg3)
+static void notify(void)
 {
     ddhub_test_assert_unlocked();
+    assert(pthread_mutex_lock(&wake_mutex) == 0);
+    notified = true;
+    assert(pthread_cond_signal(&wake_condition) == 0);
+    assert(pthread_mutex_unlock(&wake_mutex) == 0);
+}
+
+/**
+ * @brief Validate the received message and its producer sequence.
+ * @param event Matched application event mask.
+ * @param data Borrowed message payload.
+ * @param len Payload size in bytes.
+ * @param arg1 First subscriber test context.
+ * @param arg2 Second subscriber test context.
+ * @param arg3 Third subscriber test context.
+ */
+static void receive(uint32_t event, void *const data, size_t len, void *const arg1, void *const arg2, void *const arg3)
+{
+    ddhub_test_assert_unlocked();
+    (void)arg1;
     (void)arg2;
     (void)arg3;
-    struct stress_message *message = data;
-    assert((event == 1U) && (len == sizeof(*message)));
-    assert(message->visits == *(unsigned int *)arg1);
-    assert(!message->completed);
-    ++message->visits;
+    assert(event == 1U);
+    assert(len == sizeof(struct message));
+    const struct message *message = data;
+    assert(message->producer < PRODUCERS);
+    assert(message->sequence == received[message->producer]++);
+    assert(message->checksum == ((message->producer * 10000U) + message->sequence));
 }
 
 /**
- * @brief Verify producer routing, per-producer FIFO order, and exactly-once completion.
- * @param hub_id Destination hub.
- * @param event Original mask.
- * @param data Stress message.
- * @param len Stress message size.
- * @param arg Same message address supplied as producer context.
+ * @brief Validate one completion and its processing-right lifetime.
+ * @param hub_id Actual consuming hub.
+ * @param event Matched application event mask.
+ * @param data Borrowed message payload.
+ * @param len Payload size in bytes.
+ * @param arg Caller-owned context retained until completion.
  */
-static void stress_done(ddhub_id_t hub_id, uint32_t event, void *const data, size_t len, void *const arg)
+static void complete(ddhub_id_t hub_id, uint32_t event, void *const data, size_t len, void *const arg)
 {
     ddhub_test_assert_unlocked();
-    struct stress_message *message = data;
-    assert((data == arg) && (len == sizeof(*message)) && (event == 1U));
-    assert((unsigned int)hub_id == (message->producer % 2U));
-    assert(message->visits == 2U);
-    assert(message->sequence == expected_sequence[message->producer]++);
-    assert(!message->completed);
-    message->completed = true;
-    ++completed_count;
+    const struct message *message = data;
+    assert((event == 1U) && (len == sizeof(*message)) && (arg == data));
+    assert(hub_id == (ddhub_id_t)(message->producer % DDHUB_ID_COUNT));
+    assert(seen[message->producer][message->sequence]++ == 0U);
+    ++completed;
 }
 
 /**
- * @brief Submit persistent unique buffers while retrying only documented transient failures.
- * @param arg Producer index.
- * @return NULL after all messages have been accepted.
+ * @brief Publish one producer stream, retrying only a full waiting FIFO.
+ * @param arg Caller-owned context retained until completion.
+ * @return NULL after the worker completes.
  */
 static void *producer_thread(void *arg)
 {
-    unsigned int producer = *(unsigned int *)arg;
-    for (unsigned int i = 0U; i < MESSAGES_PER_PRODUCER; ++i) {
-        struct stress_message *message = &messages[producer][i];
-        message->producer = producer;
-        message->sequence = i;
+    size_t producer = *(size_t *)arg;
+    for (size_t i = 0U; i < PER_PRODUCER; ++i) {
+        struct message *message = &messages[producer][i];
+        *message = (struct message){producer, i, (producer * 10000U) + i};
         ddhub_status_t status;
         do {
-            status = ddhub_send((ddhub_id_t)(producer % 2U),
+            status = ddhub_send((ddhub_id_t)(producer % DDHUB_ID_COUNT),
                                 1U,
                                 message,
                                 sizeof(*message),
                                 message);
-            assert((status == DDHUB_OK) || (status == DDHUB_BUSY) || (status == DDHUB_QUEUE_FULL));
-            if (status != DDHUB_OK) {
+            if (status == DDHUB_QUEUE_FULL) {
                 sched_yield();
             }
-        } while (status != DDHUB_OK);
+        } while (status == DDHUB_QUEUE_FULL);
+        assert(status == DDHUB_OK);
     }
     return NULL;
 }
 
-/** @brief Stress borrowed pointer publication and notification with four concurrent producers. */
-static void test_multi_producer(void)
+/**
+ * @brief Consume a retained binary wakeup and drain on the unique worker.
+ * @param arg Caller-owned context retained until completion.
+ * @return NULL after the worker completes.
+ */
+static void *consumer_thread(void *arg)
 {
-    static unsigned int first_visit = 0U;
-    static unsigned int second_visit = 1U;
-    pthread_t           producers[PRODUCER_COUNT];
-    for (size_t i = 0U; i < 2U; ++i) {
-        assert(ddhub_set_process_done((ddhub_id_t)i, stress_done) == DDHUB_OK);
-        assert(ddhub_register((ddhub_id_t)i,
-                              &nodes[i * 2U],
-                              1U,
-                              0U,
-                              stress_consume,
-                              &first_visit,
-                              NULL,
-                              NULL) == DDHUB_OK);
-        assert(ddhub_register((ddhub_id_t)i,
-                              &nodes[(i * 2U) + 1U],
-                              1U,
-                              10U,
-                              stress_consume,
-                              &second_visit,
-                              NULL,
-                              NULL) == DDHUB_OK);
-    }
-    for (unsigned int i = 0U; i < PRODUCER_COUNT; ++i) {
-        producer_ids[i] = i;
-        assert(pthread_create(&producers[i],
-                              NULL,
-                              producer_thread,
-                              &producer_ids[i]) == 0);
-    }
-    /* Completion fields are accessed only by this single processing thread. */
-    while (completed_count != (PRODUCER_COUNT * MESSAGES_PER_PRODUCER)) {
-        ddhub_status_t status = ddhub_process_all();
-        assert((status == DDHUB_OK) || (status == DDHUB_BUSY));
-        sched_yield();
-    }
-    for (size_t i = 0U; i < PRODUCER_COUNT; ++i) {
-        assert(pthread_join(producers[i], NULL) == 0);
-        assert(expected_sequence[i] == MESSAGES_PER_PRODUCER);
-        for (size_t j = 0U; j < MESSAGES_PER_PRODUCER; ++j) {
-            assert(messages[i][j].completed);
+    (void)arg;
+    while (completed < (PRODUCERS * PER_PRODUCER)) {
+        assert(pthread_mutex_lock(&wake_mutex) == 0);
+        while (!notified) {
+            assert(pthread_cond_wait(&wake_condition, &wake_mutex) == 0);
         }
+        notified = false;
+        assert(pthread_mutex_unlock(&wake_mutex) == 0);
+        assert(ddhub_process() == DDHUB_OK);
     }
-    for (size_t i = 0U; i < 4U; ++i) {
-        assert(ddhub_unregister(&nodes[i]) == DDHUB_OK);
-    }
-    assert(ddhub_set_process_done(TEST_HUB_A, NULL) == DDHUB_OK);
-    assert(ddhub_set_process_done(TEST_HUB_B, NULL) == DDHUB_OK);
+    return NULL;
 }
 
 /**
- * @brief Run real-thread exclusion and message-publication tests with bounded CTest timeouts.
- * @return Zero if every assertion passes.
+ * @brief Test multi producer binary wakeup.
+ */
+static void test_multi_producer_binary_wakeup(void)
+{
+    assert(ddhub_set_process_notify(notify) == DDHUB_OK);
+    for (size_t i = 0U; i < DDHUB_ID_COUNT; ++i) {
+        assert(ddhub_register((ddhub_id_t)i,
+                              &nodes[i],
+                              1U,
+                              0U,
+                              receive,
+                              NULL,
+                              NULL,
+                              NULL) == DDHUB_OK);
+        assert(ddhub_set_process_done((ddhub_id_t)i, complete) == DDHUB_OK);
+    }
+    pthread_t consumer;
+    pthread_t producers[PRODUCERS];
+    size_t    ids[PRODUCERS];
+    assert(pthread_create(&consumer,
+                          NULL,
+                          consumer_thread,
+                          NULL) == 0);
+    for (size_t i = 0U; i < PRODUCERS; ++i) {
+        ids[i] = i;
+        assert(pthread_create(&producers[i],
+                              NULL,
+                              producer_thread,
+                              &ids[i]) == 0);
+    }
+    for (size_t i = 0U; i < PRODUCERS; ++i) {
+        assert(pthread_join(producers[i], NULL) == 0);
+    }
+    assert(pthread_join(consumer, NULL) == 0);
+    assert(completed == (PRODUCERS * PER_PRODUCER));
+    for (size_t i = 0U; i < PRODUCERS; ++i) {
+        assert(received[i] == PER_PRODUCER);
+    }
+    for (size_t i = 0U; i < DDHUB_ID_COUNT; ++i) {
+        assert(ddhub_unregister(&nodes[i]) == DDHUB_OK);
+        assert(ddhub_set_process_done((ddhub_id_t)i, NULL) == DDHUB_OK);
+    }
+}
+
+/** @brief Verify a send after the final empty check schedules new work before the old call returns. */
+static void test_final_check_handoff(void)
+{
+    assert(pthread_mutex_lock(&wake_mutex) == 0);
+    notified = false;
+    assert(pthread_mutex_unlock(&wake_mutex) == 0);
+    captures = 0U;
+    assert(ddhub_register(TEST_HUB_A,
+                          &nodes[0],
+                          1U,
+                          0U,
+                          capture,
+                          NULL,
+                          NULL,
+                          NULL) == DDHUB_OK);
+    struct request process = {
+        NULL,
+        TEST_HUB_A,
+        DDHUB_INVALID,
+        true
+    };
+    pthread_t consumer;
+    assert(pthread_create(&consumer,
+                          NULL,
+                          process_thread,
+                          &process) == 0);
+    /* An empty process unlocks only after its final check and active-state release. */
+    ddhub_test_wait_paused();
+    assert(ddhub_send(TEST_HUB_A,
+                      1U,
+                      NULL,
+                      0U,
+                      NULL) == DDHUB_OK);
+    assert(pthread_mutex_lock(&wake_mutex) == 0);
+    assert(notified);
+    assert(pthread_mutex_unlock(&wake_mutex) == 0);
+    assert(ddhub_process() == DDHUB_OK);
+    assert(captures == 1U);
+    ddhub_test_resume();
+    assert(pthread_join(consumer, NULL) == 0);
+    assert(process.status == DDHUB_OK);
+    assert(ddhub_unregister(&nodes[0]) == DDHUB_OK);
+}
+#endif
+
+/**
+ * @brief Execute this suite and fail on any violated dispatch contract.
+ * @return Zero after all assertions pass.
  */
 int main(void)
 {
     assert(ddhub_set_lock_ops(ddhub_test_lock, ddhub_test_unlock) == DDHUB_OK);
-    test_bool_lock_contention();
-    test_parallel_registration();
-    test_shared_node_registration();
-    test_node_owner_transfer();
-    test_parallel_hubs();
-    test_all_exclusion();
-    test_all_skips_processing_hub();
-    test_all_snapshot_during_send();
-    test_multi_producer();
-    ddhub_test_assert_unlocked();
-    puts("ddhub concurrency: parallel hubs, ALL busy-hub skipping, 2000 messages passed");
+    test_live_nodes();
+    test_unregister_commit_recheck();
+    test_writer_does_not_block_dispatch();
+#if DDHUB_ASYNC_PROCESS_ENABLE
+    test_multi_producer_binary_wakeup();
+    test_final_check_handoff();
+#endif
+    puts("ddhub concurrency passed");
     return 0;
 }

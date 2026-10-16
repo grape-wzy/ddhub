@@ -3,17 +3,19 @@
  * @brief Configure hub IDs and FIFO capacity for host tests.
  * @details ddhub stands for Data Dispatch Hub, an event-driven data distribution center.
  *          Provide three independent hubs and a three-message FIFO to test isolation and non-power-of-two wraparound.
- * @version 0.1.0
+ * @version 0.2.0
  * @date 2026-10-14 (development date)
  *
  * @par Release notes
+ * 0.2.0: Dispatch modes, global notification, draining, and live subscriptions.
  * 0.1.0: Initial version; first release.
  *
- * @par Modification history
- * - Codex 2026-10-14: Provide hub configuration independent of the firmware.
- * - Codex 2026-10-15: Add file documentation and C++ linkage guards.
- * - Codex 2026-10-15: Update the hub count enum name and separate ALL processing API.
- * - Codex 2026-10-15: Prepare version 0.1.0 with English source documentation.
+ * @par 修改记录
+ * - Codex 2026-10-14：Provide hub configuration independent of the firmware.
+ * - Codex 2026-10-15：Add file documentation and C++ linkage guards.
+ * - Codex 2026-10-15：Update the hub count enum name and separate ALL processing API.
+ * - Codex 2026-10-15：Prepare version 0.1.0 with English source documentation.
+ * - Codex 2026-10-16：Release version 0.2.0.
  */
 
 #ifndef DDHUB_TEST_CONFIG_H_

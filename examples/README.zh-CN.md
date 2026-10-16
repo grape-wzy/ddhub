@@ -2,7 +2,7 @@
 
 [English](README.md) | 简体中文
 
-**ddhub = Data Dispatch Hub（数据分发中心）**。版本 **0.1.0**：**初版，首次发布**。
+**ddhub = Data Dispatch Hub（数据分发中心）**。版本 **0.2.0**：**同步/异步分发、全局通知与动态订阅**。
 
 三个平台工程共用 `common/` 中的业务代码与示例配置，组件的默认配置不变：
 
@@ -21,10 +21,11 @@ examples/
 | `EXAMPLE_HUB_CONTROL` | `EVENT_COMMAND`，bit 2 | `on_command` | `operator` | `command=start` |
 | `EXAMPLE_HUB_CONTROL` | `EVENT_ALARM`，bit 3 | `on_alarm` | `alarm_monitor` | `alarm=clear` |
 
-平台绑定 lock/unlock 后调用一次 `ddhub_example_run()`：注册四个静态节点，发送四条静态消息，
-先调用 `ddhub_process(EXAMPLE_HUB_SENSOR)`，再调用 `ddhub_process_all()` 处理另一个 hub，最后注销节点。
-示例只在当前线程或主循环中执行，不额外创建线程；消息来源是业务发布者的标识。
-数据与节点使用静态存储，不需要动态分配。平台互斥操作仍可保护后续的并发调用。
+绑定平台锁后，调用一次 `ddhub_example_run()`。它注册四个静态节点并发送四条消息，
+异步模式调用一次 `ddhub_process()` 排空全部 hub；同步模式在 send 中直接完成分发，编译时屏蔽 process 调用。
+最后注销全部节点。示例在调用线程或主循环中轮询，不创建工作线程；全局通知和 RTOS 二值唤醒接入见使用说明。
+
+在独立构建目录添加 `-DDDHUB_ASYNC_PROCESS_ENABLE=0` 可验证同步模式；CMake 会把配置传递给组件和调用方。
 
 Windows 示例的预期输出如下，其他平台只替换方括号中的平台名称：
 

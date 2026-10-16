@@ -3,17 +3,19 @@
  * @brief Declare the host-test platform lock adapter.
  * @details ddhub stands for Data Dispatch Hub, an event-driven data distribution center.
  *          Expose pthread exclusion, thread-local validation, pause controls, and acquisition counters for ddhub tests.
- * @version 0.1.0
+ * @version 0.2.0
  * @date 2026-10-15 (development date)
  *
  * @par Release notes
+ * 0.2.0: Dispatch modes, global notification, draining, and live subscriptions.
  * 0.1.0: Initial version; first release.
  *
- * @par Modification history
- * - Codex 2026-10-15: Declare host validation interfaces for injected platform locks.
- * - Codex 2026-10-15: Allow pauses after a chosen unlock count to test cross-hub node transfer.
- * - Codex 2026-10-15: Expose platform acquisition counts to verify merged critical sections.
- * - Codex 2026-10-15: Prepare version 0.1.0 with English source documentation.
+ * @par 修改记录
+ * - Codex 2026-10-15：Declare host validation interfaces for injected platform locks.
+ * - Codex 2026-10-15：Allow pauses after a chosen unlock count to test cross-hub node transfer.
+ * - Codex 2026-10-15：Expose platform acquisition counts to verify merged critical sections.
+ * - Codex 2026-10-15：Prepare version 0.1.0 with English source documentation.
+ * - Codex 2026-10-16：Release version 0.2.0.
  */
 
 #ifndef DDHUB_TEST_LOCK_H_

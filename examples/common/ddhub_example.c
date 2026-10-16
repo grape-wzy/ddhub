@@ -4,15 +4,18 @@
  * @details ddhub stands for Data Dispatch Hub, an event-driven data distribution center.
  *          Use static nodes and messages to print the platform, source, content, destination hub, callback, and event
  * mask.
- * @version 0.1.0
+ * @version 0.2.0
  * @date 2026-10-15 (development date)
  *
  * @par Release notes
+ * 0.2.0: Dispatch modes, global notification, draining, and live subscriptions.
  * 0.1.0: Initial version; first release.
  *
- * @par Modification history
- * - Codex 2026-10-15: Add shared registration, publication, and dispatch for three platform examples.
- * - Codex 2026-10-15: Prepare version 0.1.0 with English source documentation.
+ * @par 修改记录
+ * - Codex 2026-10-15： Add shared registration, publication, and dispatch for three platform examples.
+ * - Codex 2026-10-15： Prepare version 0.1.0 with English source documentation.
+ * - Codex 2026-10-16：Run the shared example in synchronous and asynchronous modes.
+ * - Codex 2026-10-16：Release version 0.2.0.
  */
 
 #include "ddhub_example.h"
@@ -154,6 +157,11 @@ static void on_alarm(uint32_t event, void *const data, size_t len, void *const a
                   len);
 }
 
+/**
+ * @brief Register, send, optionally drain, and unregister the shared example.
+ * @param platform Platform label retained until this call completes.
+ * @return First failed operation, or DDHUB_OK after all messages complete.
+ */
 ddhub_status_t ddhub_example_run(const char *platform)
 {
     static const struct {
@@ -195,17 +203,14 @@ ddhub_status_t ddhub_example_run(const char *platform)
         }
     }
 
-    /* An explicit hub call consumes SENSOR only; ALL then consumes CONTROL. */
-    ddhub_status_t status = ddhub_process(EXAMPLE_HUB_SENSOR);
-    if (status != DDHUB_OK) {
-        return status;
+#if DDHUB_ASYNC_PROCESS_ENABLE
+    ddhub_status_t process_status = ddhub_process();
+    if (process_status != DDHUB_OK) {
+        return process_status;
     }
-    status = ddhub_process_all();
-    if (status != DDHUB_OK) {
-        return status;
-    }
+#endif
     for (size_t i = 0U; i < (sizeof(subscriptions) / sizeof(subscriptions[0])); ++i) {
-        status = ddhub_unregister(&subscriptions[i]);
+        ddhub_status_t status = ddhub_unregister(&subscriptions[i]);
         if (status != DDHUB_OK) {
             return status;
         }
